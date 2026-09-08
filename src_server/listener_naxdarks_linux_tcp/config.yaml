@@ -1,0 +1,10 @@
+# NaxDarks Linux TCP Listener
+# Handles both bind (pivot) and connect-out Linux agents.
+
+extender_type: "listener"
+extender_file: "listener_naxdarks_linux_tcp.so"
+ax_file:       "ax_config.axs"
+
+listener_name: "NaxDarksTCP"
+listener_type: "external"
+protocol:      "tcp"

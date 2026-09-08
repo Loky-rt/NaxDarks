@@ -1,0 +1,121 @@
+{
+  "callbacks": [
+    {
+      "hosts": ["10.10.16.22:443"],
+      "user_agent": "Amazon CloudFront",
+      "beacon_id_header": "X-Amz-Cf-Id",
+      "rotation": "random",
+
+      "server_error": {
+        "status": 503,
+        "body": "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>ServiceUnavailable</Code><Message>Service is unable to handle request.</Message><RequestId>F5E2D3C4B1A09876</RequestId></Error>",
+        "headers": {
+          "Content-Type": "text/xml",
+          "Server": "AmazonS3",
+          "x-amz-request-id": "F5E2D3C4B1A09876",
+          "x-amz-id-2": "vlR7PnpV2Ce81l0PRw6jlUpck7aFV5B/i4p+C0yKfE3gYo2hVDJ7gA==",
+          "Connection": "close"
+        }
+      },
+
+      "get": {
+        "uri": [
+          "/d/cf-dist/assets/main.woff2",
+          "/d/cf-dist/css/styles.min.css",
+          "/d/cf-dist/img/logo.svg",
+          "/d/cf-dist/manifest.json"
+        ],
+        "client": {
+          "headers": {
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Origin": "https://cdn.example.com",
+            "Sec-Fetch-Dest": "font",
+            "Sec-Fetch-Mode": "cors"
+          },
+          "metadata": {
+            "format": "hex",
+            "mask": false,
+            "placement": "cookie",
+            "name": "CloudFront-Key-Pair-Id",
+            "prepend": "APKA",
+            "append": ""
+          },
+          "parameters": {
+            "Expires": "1733011200",
+            "Policy": "eyJ2ZXJzaW9uIjoiMiJ9"
+          }
+        },
+        "server": {
+          "headers": {
+            "Content-Type": "font/woff2",
+            "Server": "AmazonS3",
+            "x-amz-cf-pop": "IAD89-P2",
+            "x-amz-cf-id": "noop",
+            "Via": "1.1 abc123.cloudfront.net (CloudFront)",
+            "X-Cache": "Hit from cloudfront",
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=31536000, immutable"
+          },
+          "output": {
+            "format": "base64url",
+            "mask": false,
+            "placement": "body",
+            "name": "",
+            "prepend": "",
+            "append": "",
+            "empty_response": ""
+          }
+        }
+      },
+
+      "post": {
+        "uri": [
+          "/prod/api/events",
+          "/prod/api/metrics",
+          "/prod/api/logs/ingest"
+        ],
+        "client": {
+          "headers": {
+            "Content-Type": "application/x-amz-json-1.1",
+            "Accept": "application/json",
+            "X-Amz-Target": "Logs_20140328.PutLogEvents",
+            "X-Amz-Date": "20241201T000000Z"
+          },
+          "metadata": {
+            "format": "raw",
+            "mask": false,
+            "placement": "parameter",
+            "name": "X-Amz-Security-Token",
+            "prepend": "",
+            "append": ""
+          },
+          "output": {
+            "format": "hex",
+            "mask": true,
+            "placement": "body",
+            "name": "",
+            "prepend": "{\"logGroupName\":\"/aws/lambda/prod-handler\",\"logStreamName\":\"2024/12/01/[$LATEST]\",\"logEvents\":[{\"timestamp\":1733011200000,\"message\":\"",
+            "append": "\"}],\"sequenceToken\":\"49641086694350286920040691822737707097\"}"
+          }
+        },
+        "server": {
+          "headers": {
+            "Content-Type": "application/x-amz-json-1.1",
+            "Server": "AmazonS3",
+            "x-amzn-RequestId": "a1b2c3d4-5678-90ab-cdef-111111111111"
+          },
+          "output": {
+            "format": "hex",
+            "mask": false,
+            "placement": "body",
+            "name": "",
+            "prepend": "{\"nextSequenceToken\":\"49641086694350286920040691822737707098\",\"_data\":\"",
+            "append": "\",\"rejectedLogEventsInfo\":null}",
+            "empty_response": "{\"nextSequenceToken\":\"49641086694350286920040691822737707098\"}"
+          }
+        }
+      }
+    }
+  ]
+}

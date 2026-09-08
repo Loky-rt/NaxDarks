@@ -1,0 +1,15 @@
+# agent_naxdarks_linux — Adaptix extender config (Linux agent)
+#
+# Compatible listeners:
+#   NaxDarksTCP — NaxDarks TCP bind listener configured for Linux agents (deadbeef WM)
+
+extender_type: "agent"
+extender_file: "agent_naxdarks_linux.so"
+ax_file: "ax_config.axs"
+
+agent_name: "NaxDarks"
+agent_watermark: "deadbeef"
+listeners:
+  - "NaxDarksTCP"
+  - "NaxDarksHTTPS"
+multi_listeners: false

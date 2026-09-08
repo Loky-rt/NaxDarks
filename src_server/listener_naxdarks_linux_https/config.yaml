@@ -1,0 +1,8 @@
+# NaxDarks HTTP listener config
+extender_type: "listener"
+extender_file: "listener_naxdarks_linux_https.so"
+ax_file: "ax_config.axs"
+
+listener_name: "NaxDarksHTTPS"
+listener_type: "external"
+protocol: "https"

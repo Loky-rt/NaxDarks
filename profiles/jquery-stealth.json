@@ -1,0 +1,102 @@
+{
+  "callbacks": [
+    {
+      "hosts": ["192.168.100.129:8080"],
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "beacon_id_header": "X-Correlation-Id",
+      "rotation": "sequential",
+
+      "server_error": {
+        "status": 404,
+        "body": "<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><center><h1>404 Not Found</h1></center><hr><center>nginx/1.24.0</center></body></html>",
+        "headers": {
+          "Content-Type": "text/html",
+          "Server": "nginx/1.24.0",
+          "Connection": "keep-alive"
+        }
+      },
+
+      "get": {
+        "uri": ["/jquery-3.3.1.min.js", "/assets/js/analytics.js", "/static/bundle.js"],
+        "client": {
+          "headers": {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate",
+            "Referer": "https://www.google.com/"
+          },
+          "metadata": {
+            "format": "base64",
+            "mask": true,
+            "placement": "cookie",
+            "name": "__cfduid",
+            "prepend": "",
+            "append": ""
+          },
+          "parameters": {
+            "v": "3.3.1"
+          }
+        },
+        "server": {
+          "headers": {
+            "Content-Type": "application/javascript; charset=utf-8",
+            "Cache-Control": "max-age=0, public",
+            "X-Content-Type-Options": "nosniff",
+            "Server": "nginx/1.24.0"
+          },
+          "output": {
+            "format": "base64",
+            "mask": true,
+            "placement": "body",
+            "name": "",
+            "prepend": "/*! jQuery v3.3.1 | (c) JS Foundation and other contributors | jquery.org/license */\n!function(e,t){\"use strict\";\"object\"==typeof module&&\"object\"==typeof module.exports?module.exports=e.document?t(e,!0):function(e){if(!e.document)throw new Error(\"jQuery requires a window with a document\");return t(e)}:t(e)}(\"undefined\"!=typeof window?window:this,function(e,t){\"use strict\";var n=[],r=e.document,i=Object.getPrototypeOf,o=n.slice;\n/* data: ",
+            "append": " */\n});",
+            "empty_response": "/*! jQuery v3.3.1 | (c) JS Foundation and other contributors | jquery.org/license */\n!function(e,t){\"use strict\"}(\"undefined\"!=typeof window?window:this,function(e,t){\"use strict\";});"
+          }
+        }
+      },
+
+      "post": {
+        "uri": ["/api/v1/telemetry", "/api/v1/analytics", "/submit"],
+        "client": {
+          "headers": {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Requested-With": "XMLHttpRequest"
+          },
+          "metadata": {
+            "format": "base64url",
+            "mask": false,
+            "placement": "header",
+            "name": "X-Request-Id",
+            "prepend": "",
+            "append": ""
+          },
+          "output": {
+            "format": "base64",
+            "mask": true,
+            "placement": "body",
+            "name": "",
+            "prepend": "{\"status\":\"ok\",\"telemetry\":\"",
+            "append": "\",\"version\":\"2.1.0\"}"
+          }
+        },
+        "server": {
+          "headers": {
+            "Content-Type": "application/json",
+            "Server": "nginx/1.24.0"
+          },
+          "output": {
+            "format": "raw",
+            "mask": false,
+            "placement": "body",
+            "name": "",
+            "prepend": "",
+            "append": "",
+            "empty_response": "{\"status\":\"accepted\"}"
+          }
+        }
+      }
+    }
+  ]
+}
