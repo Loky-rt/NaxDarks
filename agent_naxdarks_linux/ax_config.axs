@@ -15,8 +15,14 @@ function GenerateUI(listeners_type)
 
     let comboArch = form.create_combo();
     comboArch.addItems(["x64", "arm64"]);
+
+    let comboFormat = form.create_combo();
+    comboFormat.addItems(["elf", "so"]);
     tab1.addWidget(form.create_label("Architecture:"), t1r, 0);
     tab1.addWidget(comboArch, t1r, 1); t1r++;
+
+    tab1.addWidget(form.create_label("Format:"), t1r, 0);
+    tab1.addWidget(comboFormat, t1r, 1); t1r++;
 
     let comboMode = form.create_combo();
     if (isHttps) {
@@ -67,6 +73,7 @@ function GenerateUI(listeners_type)
     rootPanel.setLayout(rootLayout);
 
     container.put("arch",      comboArch);
+    container.put("format",    comboFormat);
     container.put("tcp_mode",  comboMode);
     container.put("debug",     checkDebug);
     container.put("inmem",     checkInMem);

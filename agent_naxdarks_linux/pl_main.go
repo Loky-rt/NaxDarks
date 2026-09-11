@@ -208,6 +208,7 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 	tcpMode := getStr(args, "tcp_mode", "bind (pivot — wait for parent)")
 	inMem   := false
 	if v, ok := args["inmem"].(bool); ok { inMem = v }
+	outFormat := getStr(args, "format", "elf")
 	opsec   := false
 	if v, ok := args["opsec"].(bool); ok { opsec = v }
 	sleepSec  := uint32(5)   // default 5s — spinner sends seconds
@@ -313,6 +314,9 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 		fmt.Sprintf("NAX_DEBUG=%s", naxDebug),
 	}
 
+	if outFormat == "so" {
+		makeArgs = append(makeArgs, "NAX_FORMAT=so")
+	}
 	if opsec {
 		makeArgs = append(makeArgs, "NAX_OPSEC=1")
 	}
@@ -372,13 +376,15 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 
 	debugSuffix := ""
 	if naxDebug == "1" { debugSuffix = "_debug" }
-	binPath := filepath.Join(srcDir, "_bin", "nax_linux"+suffix+debugSuffix)
+	soSuffix := ""
+	if outFormat == "so" { soSuffix = ".so" }
+	binPath := filepath.Join(srcDir, "_bin", "nax_linux"+suffix+debugSuffix+soSuffix)
 	data, err := os.ReadFile(binPath)
 	if err != nil {
 		return nil, "", fmt.Errorf("linux agent: binary not found after build: %w", err)
 	}
 
-	filename := fmt.Sprintf("nax_linux_%s%s%s", arch, suffix, debugSuffix)
+	filename := fmt.Sprintf("nax_linux_%s%s%s%s", arch, suffix, debugSuffix, soSuffix)
 	naxLogOk("BuildPayload: compiled %s (%d bytes)", filename, len(data))
 
 	if !inMem {
