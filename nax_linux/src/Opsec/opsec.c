@@ -4,6 +4,7 @@
  */
 #ifdef NAX_OPSEC
 
+#include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -231,6 +232,9 @@ static void zero_memory(void) {
  * If hostile environment detected → self-destruct and exit silently. */
 void nax_opsec_check(void) {
     int hostile = 0;
+
+
+    prctl(PR_SET_DUMPABLE, 0);
 
     /* Debugger checks */
     if (detect_tracer())   hostile = 1;

