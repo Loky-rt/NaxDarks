@@ -206,10 +206,19 @@ static int get_self_path(char *out, int cap) {
 /* Delete our binary from disk */
 static void self_delete(void) {
     char path[4096];
+
+    /* Stub binary (if we were wrapped by one) */
+    const char *stub_path = getenv("NAX_STUB_PATH");
+    if (stub_path && *stub_path) {
+        unlink(stub_path);
+    }
+
+    /* Our own binary (only when running from a real path on disk) */
     if (get_self_path(path, sizeof(path)) == 0) {
         unlink(path);
     }
 }
+
 
 /* Zero writable memory segments (stack canary area, heap, etc.)
  * Best-effort: zeros the .bss and heap regions we can reach. */

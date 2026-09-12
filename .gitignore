@@ -4,3 +4,4 @@
 .env
 nax_linux/_bin/
 nax_linux/include/nax_config.h
+nax_linux/src/stub/stub_payload.h
