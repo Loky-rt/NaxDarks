@@ -33,10 +33,11 @@ NAX_SLEEP_MS    ?= 5000
 NAX_JITTER_PCT  ?= 0
 NAX_STUB        ?= 1
 
+RODATA_CRYPT    := src/stub/rodata_crypt.py
 STUB_DIR        := src/stub
 STUB_SRC        := $(STUB_DIR)/stub.c
 STUB_PAYLOAD    := $(STUB_DIR)/stub_payload.h
-STUB_GEN        := $(STUB_DIR)/gen_stub_payload.sh
+STUB_GEN        := $(STUB_DIR)/gen_stub_payload.py
 
 BOF_SDK_DIR := deps/elf-bof
 BOF_SDK_INC := $(BOF_SDK_DIR)/include
@@ -139,8 +140,10 @@ ifeq ($(NAX_FORMAT),so)
   CFLAGS := $(subst -fPIE,-fPIC,$(CFLAGS))
   LDFLAGS := $(subst -pie,-shared,$(LDFLAGS))
   SUFFIX := $(SUFFIX).so
+  RODATA_ENCRYPT := 1
 else
   SRCS   += src/main.c
+  RODATA_ENCRYPT := 0
 endif
 
 TARGET  := $(OUTDIR)/nax_linux$(SUFFIX)
@@ -160,6 +163,10 @@ endif
 # --- 1. Agente ---
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) $(SRCS) -o $(TARGET) $(BOF_SDK_LIB) $(LDFLAGS) $(LDFLAGS_EXTRA)
+ifeq ($(RODATA_ENCRYPT),1)
+	@echo "[+] Encrypting .rodata in $(TARGET)"
+	python3 $(RODATA_CRYPT) $(TARGET)
+endif
 ifeq ($(NAX_DEBUG),0)
 	$(STRIP) $(TARGET)
 endif
@@ -172,7 +179,7 @@ ifeq ($(NAX_STUB),1)
 
 $(STUB_PAYLOAD): $(TARGET) $(STUB_GEN)
 	@echo "[+] Generating stub payload from $(TARGET)"
-	@cd $(STUB_DIR) && bash gen_stub_payload.sh ../../$(TARGET) >/dev/null
+	@cd $(STUB_DIR) && python3 gen_stub_payload.py ../../$(TARGET) >/dev/null
 
 $(OUTDIR)/.stub_built: $(TARGET) $(STUB_PAYLOAD) $(STUB_SRC)
 	@echo "[+] Wrapping $(TARGET) with stub"

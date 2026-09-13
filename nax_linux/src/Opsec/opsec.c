@@ -243,7 +243,7 @@ void nax_opsec_check(void) {
     int hostile = 0;
 
 
-    prctl(PR_SET_DUMPABLE, 0);
+//    prctl(PR_SET_DUMPABLE, 0);
 
     /* Debugger checks */
     if (detect_tracer())   hostile = 1;
