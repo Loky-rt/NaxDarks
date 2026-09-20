@@ -1,7 +1,4 @@
-/* bof_async.h — Async BOF job infrastructure for NaxDarks
- * Provides thread-based background BOF execution with output queuing.
- */
-
+// bof_async.h - Provides thread-based background BOF execution with output queuing
 #ifndef BOF_ASYNC_H
 #define BOF_ASYNC_H
 

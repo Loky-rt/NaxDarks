@@ -1,19 +1,22 @@
 #ifndef LINUX_BEACON_API_H
 #define LINUX_BEACON_API_H
 
-#include <sys/statvfs.h>
-#include <time.h>
-#include <stddef.h>
-#include <stdarg.h>
-#include <sys/wait.h>      // waitpid
-#include <signal.h>        // kill
-#include <sys/ptrace.h>    // ptrace
-#include <sys/uio.h>       // process_vm_readv/writev
-#include <sys/stat.h>      // chmod, fchmod
-#include <sys/ioctl.h>     // ioctl
-#include <sys/sysinfo.h>   // sysinfo
-#include <sys/utsname.h>   // uname
-#include <linux/io_uring.h>// io_uring
+#include <sys/types.h>     /* ssize_t, size_t, socklen_t, mode_t, uid_t, gid_t */
+#include <sys/statvfs.h>   /* struct statvfs */
+#include <sys/stat.h>      /* chmod, fchmod */
+#include <sys/wait.h>      /* waitpid */
+#include <sys/ptrace.h>    /* ptrace */
+#include <sys/uio.h>       /* process_vm_readv/writev, struct iovec */
+#include <sys/ioctl.h>     /* ioctl */
+#include <sys/sysinfo.h>   /* struct sysinfo */
+#include <sys/utsname.h>   /* struct utsname */
+#include <sys/socket.h>    /* socklen_t */
+#include <netinet/in.h>    /* struct sockaddr_in */
+#include <linux/io_uring.h>/* io_uring_params */
+#include <stddef.h>        /* size_t (redundante con sys/types pero seguro) */
+#include <stdarg.h>        /* va_list */
+#include <time.h>          /* time_t, struct tm */
+#include <signal.h>        /* kill */
 
 /* ── Data parser types ── */
 
@@ -68,37 +71,39 @@ int    BeaconGetStopJobEvent(void);
 
 /* File system */
 
-int    AxFstatvfs(int fd, struct statvfs *buf);
-int    AxStatvfs(const char *path, struct statvfs *buf);
-int    AxWriteFile(int fd, const void *buf, int count);
+int     AxFstatvfs(int fd, struct statvfs *buf);
+int     AxStatvfs(const char *path, struct statvfs *buf);
+ssize_t AxWriteFile(int fd, const void *buf, size_t count);
 char   *AxRealpath(const char *path, char *resolved_path);
-int    AxOpenFile(const char *path, int flags, int mode);
-int    AxCloseFile(int fd);
-int    AxReadFile(int fd, void *buf, int count);
-int    AxReadFileToBuffer(const char *path, char **out_buf, int max_size);
-int    AxFileStat(const char *path, unsigned int *out_mode, long *out_size,
-                  unsigned int *out_uid, unsigned int *out_gid);
-int    AxOpenDir(const char *path);
-int    AxReadDir(int fd, void *buf, int bufsize);
+int     AxOpenFile(const char *path, int flags, int mode);
+int     AxCloseFile(int fd);
+ssize_t AxReadFile(int fd, void *buf, size_t count);
+int     AxReadFileToBuffer(const char *path, char **out_buf, int max_size);
+int     AxFileStat(const char *path, unsigned int *out_mode, long *out_size,
+                   unsigned int *out_uid, unsigned int *out_gid);
+int     AxOpenDir(const char *path);
+int     AxReadDir(int fd, void *buf, int bufsize);
 
 /* Memory */
 
-void  *AxMalloc(int size);
+void  *AxMalloc(size_t size);
 void   AxFree(void *ptr);
-void  *AxMemset(void *s, int c, int n);
-void  *AxMemcpy(void *dst, const void *src, int n);
+void  *AxMemset(void *s, int c, size_t n);
+void  *AxMemcpy(void *dst, const void *src, size_t n);
+void  *AxMemmove(void *dst, const void *src, size_t n);
+int    AxMemcmp(const void *a, const void *b, size_t n);
 
 /* Strings */
 
-int    AxStrlen(const char *s);
+size_t AxStrlen(const char *s);
 int    AxStrcmp(const char *a, const char *b);
-int    AxStrncmp(const char *a, const char *b, int n);
+int    AxStrncmp(const char *a, const char *b, size_t n);
 char  *AxStrcpy(char *dst, const char *src);
-char  *AxStrncpy(char *dst, const char *src, int n);
+char  *AxStrncpy(char *dst, const char *src, size_t n);
 char  *AxStrcat(char *dst, const char *src);
 char  *AxStrstr(const char *haystack, const char *needle);
 char  *AxStrchr(const char *s, int c);
-int    AxSnprintf(char *buf, int size, const char *fmt, ...);
+int    AxSnprintf(char *buf, size_t size, const char *fmt, ...);
 
 /* Process info */
 
@@ -115,22 +120,22 @@ int    AxSetFileTime(const char *path, long atime, long mtime);
 
 /* Networking */
 
-int    AxSocket(int domain, int type, int protocol);
-int    AxConnect(int sockfd, const void *addr, int addrlen);
-int    AxBind(int sockfd, const void *addr, int addrlen);
-int    AxListen(int sockfd, int backlog);
-int    AxAccept(int sockfd, void *addr, int *addrlen);
-int    AxSend(int sockfd, const void *buf, int len, int flags);
-int    AxRecv(int sockfd, void *buf, int len, int flags);
-int    AxSendto(int sockfd, const void *buf, int len, int flags,
-                const void *dest_addr, int addrlen);
-int    AxRecvfrom(int sockfd, void *buf, int len, int flags,
-                  void *src_addr, int *addrlen);
-int    AxClose(int fd);
-int    AxSetsockopt(int sockfd, int level, int optname,
-                    const void *optval, int optlen);
-int    AxGetsockopt(int sockfd, int level, int optname,
-                    void *optval, int *optlen);
+int     AxSocket(int domain, int type, int protocol);
+int     AxConnect(int sockfd, const void *addr, int addrlen);
+int     AxBind(int sockfd, const void *addr, int addrlen);
+int     AxListen(int sockfd, int backlog);
+int     AxAccept(int sockfd, void *addr, int *addrlen);
+ssize_t AxSend(int sockfd, const void *buf, size_t len, int flags);
+ssize_t AxRecv(int sockfd, void *buf, size_t len, int flags);
+ssize_t AxSendto(int sockfd, const void *buf, size_t len, int flags,
+                 const void *dest_addr, socklen_t addrlen);
+ssize_t AxRecvfrom(int sockfd, void *buf, size_t len, int flags,
+                   void *src_addr, socklen_t *addrlen);
+int     AxClose(int fd);
+int     AxSetsockopt(int sockfd, int level, int optname,
+                     const void *optval, int optlen);
+int     AxGetsockopt(int sockfd, int level, int optname,
+                     void *optval, int *optlen);
 
 /* Address conversion */
 
@@ -146,16 +151,21 @@ int    AxGetErrno(void);
 int    AxFcntl(int fd, int cmd, int arg);
 int    AxPoll(void *fds, int nfds, int timeout_ms);
 
-/* NEW APIs Process control */
+/* Process control
+ *
+ * AxClone eliminado — la firma imitaba clone(2) de glibc pero la
+ * implementación ejecutaba SYS_clone crudo, sin ejecutar fn(arg) en el
+ * hijo. Para clone(2) real: LIBC$clone vía runtime resolver.
+ * Para fork: AxFork().
+ */
 
-int     AxClone(int (*fn)(void *), void *child_stack, int flags, void *arg);
 int     AxExecveat(int dirfd, const char *pathname, char *const argv[],
                    char *const envp[], int flags);
 int     AxSocketpair(int domain, int type, int protocol, int sv[2]);
-void AxExit(int status);
-int  AxPipe(int fd[2]);
-int  AxMemfdCreate(const char *name, unsigned int flags);
-int  AxFexecve(int fd, char *const argv[], char *const envp[]);
+void    AxExit(int status);
+int     AxPipe(int fd[2]);
+int     AxMemfdCreate(const char *name, unsigned int flags);
+int     AxFexecve(int fd, char *const argv[], char *const envp[]);
 int     AxFork(void);
 int     AxExecve(const char *path, char *const argv[], char *const envp[]);
 int     AxWaitpid(int pid, int *status, int options);

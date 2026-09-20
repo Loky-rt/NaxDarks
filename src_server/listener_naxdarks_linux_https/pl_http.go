@@ -108,6 +108,13 @@ func newHTTPServer(name, config string, ts Teamserver) (*httpServer, error) {
 	for _, u := range profile.Post.URIs {
 		uriSet[u] = struct{}{}
 	}
+	// Pre-profile URIs — the agent uses these before receiving the malleable profile
+	if v, ok := cfg["pre_get_uri"].(string); ok && v != "" {
+		uriSet[v] = struct{}{}
+	}
+	if v, ok := cfg["pre_post_uri"].(string); ok && v != "" {
+		uriSet[v] = struct{}{}
+	}
 
 	hbHeader := profile.BeaconIdHeader
 	if hbHeader == "" {
@@ -194,10 +201,14 @@ func newHTTPServer(name, config string, ts Teamserver) (*httpServer, error) {
 	// Always include X-Beacon-Id as the pre-profile bootstrap header.
 	// The Linux agent sends REGISTER with X-Beacon-Id (profile not loaded yet),
 	// then switches to the profile's beacon_id_hdr for subsequent GETs.
-	if hbHeader != "X-Beacon-Id" {
-		s.beaconIDHeaders = []string{hbHeader, "X-Beacon-Id"}
-	} else {
-		s.beaconIDHeaders = []string{hbHeader}
+	// Accept both the profile's beacon header and the pre-profile header
+	preBeaconHdr := "X-Beacon-Id"
+	if v, ok := cfg["pre_beacon_hdr"].(string); ok && v != "" {
+		preBeaconHdr = v
+	}
+	s.beaconIDHeaders = []string{hbHeader}
+	if preBeaconHdr != hbHeader {
+		s.beaconIDHeaders = append(s.beaconIDHeaders, preBeaconHdr)
 	}
 	s.loadProfileOverrides()
 	return s, nil

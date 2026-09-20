@@ -146,7 +146,33 @@ function ListenerUI(mode_create)
 
     let postPanel = form.create_panel(); postPanel.setLayout(postLayout);
 
-    // ========= [ Tab 5: Error ] =========
+    // ========= [ Tab 5: Pre-Profile ] =========
+    // These values are used by the agent BEFORE it receives the malleable profile.
+    // The first connection (REGISTER) always uses these values.
+    // Configure them to match your redirector's filtering rules.
+
+    let textPreGetUri   = form.create_textline("/news/feed");
+    textPreGetUri.setEnabled(mode_create);
+    let textPrePostUri  = form.create_textline("/api/submit");
+    textPrePostUri.setEnabled(mode_create);
+    let textPreBeaconHdr = form.create_textline("X-Beacon-Id");
+    textPreBeaconHdr.setEnabled(mode_create);
+    let textPrePublicHdr = form.create_textline("X-NaX-Public");
+    textPrePublicHdr.setEnabled(mode_create);
+    let textPreUA = form.create_textline("Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0");
+    textPreUA.setEnabled(mode_create);
+
+    let preLayout = form.create_gridlayout();
+    preLayout.addWidget(form.create_label("GET URI:"),        0, 0); preLayout.addWidget(textPreGetUri,    0, 1);
+    preLayout.addWidget(form.create_label("POST URI:"),       1, 0); preLayout.addWidget(textPrePostUri,   1, 1);
+    preLayout.addWidget(form.create_label("Beacon Header:"),  2, 0); preLayout.addWidget(textPreBeaconHdr, 2, 1);
+    preLayout.addWidget(form.create_label("Public Header:"),  3, 0); preLayout.addWidget(textPrePublicHdr, 3, 1);
+    preLayout.addWidget(form.create_label("User-Agent:"),     4, 0); preLayout.addWidget(textPreUA,        4, 1);
+    preLayout.addWidget(form.create_vspacer(), 5, 0, 1, 2);
+
+    let prePanel = form.create_panel(); prePanel.setLayout(preLayout);
+
+    // ========= [ Tab 6: Error ] =========
 
     let spinErrStatus = form.create_spin(); spinErrStatus.setRange(100,599); spinErrStatus.setValue(404);
     spinErrStatus.setEnabled(mode_create);
@@ -245,6 +271,7 @@ function ListenerUI(mode_create)
     tabs.addTab(genPanel,  "General");
     tabs.addTab(getPanel,  "GET");
     tabs.addTab(postPanel, "POST");
+    tabs.addTab(prePanel,  "Pre-Profile");
     tabs.addTab(errPanel,  "Error");
 
     let mainLayout = form.create_vlayout();
@@ -264,7 +291,12 @@ function ListenerUI(mode_create)
     container.put("ssl_cert",        certSelector);
     container.put("ssl_key",         keySelector);
     container.put("callbacks_hosts", textHosts);
-    container.put("profile_json",   textProfileJson);
+    container.put("profile_json",    textProfileJson);
+    container.put("pre_get_uri",     textPreGetUri);
+    container.put("pre_post_uri",    textPrePostUri);
+    container.put("pre_beacon_hdr",  textPreBeaconHdr);
+    container.put("pre_public_hdr",  textPrePublicHdr);
+    container.put("pre_user_agent",  textPreUA);
 
     return { ui_panel: panel, ui_container: container, ui_height: 320, ui_width: 550 };
 }

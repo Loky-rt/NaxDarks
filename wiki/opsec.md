@@ -1,8 +1,10 @@
 # OPSEC Module
 
-- The OPSEC module provides anti-debug, anti-VM, and self-destruct capabilities. It is a **compile-time option** — when disabled, all OPSEC functions compile to no-ops with zero overhead.
+The OPSEC module provides anti-debug, anti-VM, and self-destruct capabilities. It is a **compile-time option** — when disabled, all OPSEC functions compile to no-ops with zero overhead.
 
 - Sleep Obfuscation: Always active, only on HTTPS transport
+- Pre-profile string obfuscation: Always active on all transports
+
 ---
 
 ## Enabling OPSEC
@@ -61,6 +63,8 @@ Agent start
 ## Layer 1: Startup Checks
 
 `nax_opsec_check()` runs **before any C2 communication**. If any check triggers, the agent self-deletes and exits silently with `_exit(0)` — no error message, no log, no cleanup.
+
+> **Note:** `prctl(PR_SET_DUMPABLE, 0)` was removed in commit `3aa9eb4` because it interfered with in-memory injection techniques. Memory dump protection is now handled by Sleep Obfuscation (Layer 4) instead.
 
 ### Debugger Detection
 
@@ -127,7 +131,6 @@ The HTTPS transport automatically obfuscates sensitive data during sleep cycles 
 | `a->session_id` | `16 bytes` | `Heap` | `Hex session identifier` |
 | `g_profile` | `~2KB` | `Global` | `Full malleable C2 profile structure` |
 
-
 ### How it works
 
 1. Generate random key — 64 bytes from /dev/urandom per sleep cycle
@@ -137,7 +140,6 @@ The HTTPS transport automatically obfuscates sensitive data during sleep cycles 
 5. Sleep — Data remains obfuscated during the entire sleep period
 6. Restore — Retrieve key from memfd, XOR again to decrypt, zero restore buffer
 
-
 ### Key characteristics
 
 1. Per-cycle random key — Each sleep uses a different 64-byte XOR key
@@ -146,26 +148,49 @@ The HTTPS transport automatically obfuscates sensitive data during sleep cycles 
 4. Transparent restoration — Data is automatically restored after waking
 5. Volatile qualifiers — Prevents compiler optimizations from exposing data
 
-### Verification
-
-Debug output showing the obfuscation in action:
-
-```bash
-[NAX-DBG 09:56:05.716] [DEBUG] === BEFORE OBFUSCATION ===
-[NAX-DBG 09:56:05.716] [DEBUG] AES key full: 957b7591bc66ac4a3a01dfe0a50139f5
-[NAX-DBG 09:56:05.716] [DEBUG] Session ID: fee7236b21a9ad90
-[NAX-DBG 09:56:05.716] [DEBUG] Session ID hex[0..3]: 66 65 65 37
-[NAX-DBG 09:56:05.717] [DEBUG] === DURING OBFUSCATION ===
-[NAX-DBG 09:56:05.717] [DEBUG] AES key full: 5eb5e26f8a764e87de010ee91de06fdd <-- COMPLETELY DIFFERENT
-[NAX-DBG 09:56:05.717] [DEBUG] Session ID hex: ffffffb0013f587e45ffffffa155160ffffffff5ffffffba40310e05 <-- COMPLETELY DIFFERENT
-[NAX-DBG 09:56:05.717] [DEBUG] Key stored in memfd (fd=4)
-[NAX-DBG 09:56:10.717] sleep done — next heartbeat cycle
-```
-
 ### Limitations
 
 1. Only active in HTTPS transport mode (not TCP connect-out or TCP bind)
 2. Only protects data during sleep — not during active communication
+
+---
+
+## Layer 5: Pre-Profile String Obfuscation
+
+Pre-profile strings (URIs, headers, User-Agent, comm name) are no longer hardcoded in the binary. Instead, they are emitted by the agent plugin (`pl_main.go`) as per-character volatile stores in `nax_config.h`, configured by the operator when creating the listener.
+
+### Configurable pre-profile fields
+
+| Field | Macro | Description |
+|-------|-------|-------------|
+| GET URI | `NAX_URI_GET_WRITE(p)` | Bootstrap GET path (e.g. `/news/feed`) |
+| POST URI | `NAX_URI_POST_WRITE(p)` | Bootstrap POST path (e.g. `/api/submit`) |
+| Beacon header | `NAX_BEACON_HDR_WRITE(p)` | Session ID header name (e.g. `X-Beacon-Id`) |
+| Public header | `NAX_PUBLIC_HDR_WRITE(p)` | Registration public header (e.g. `X-NaX-Public`) |
+| User-Agent | `NAX_UA_WRITE(p)` | HTTP User-Agent string |
+| Comm name | `NAX_COMM_NAME_WRITE(p)` | Process name shown in `/proc/self/comm` |
+
+### How it works
+
+Each macro writes the string one byte at a time using volatile stores:
+
+```c
+#define NAX_URI_GET_WRITE( p ) do { \
+    (p)[0]='/'; (p)[1]='n'; (p)[2]='e'; (p)[3]='w'; \
+    (p)[4]='s'; (p)[5]='/'; (p)[6]='f'; (p)[7]='e'; \
+    (p)[8]='e'; (p)[9]='d'; (p)[10]='\0'; \
+} while(0)
+```
+
+The compiler cannot fold these into a string literal — no contiguous bytes appear in `.rodata`. `strings` on the binary shows nothing.
+
+### OPSEC benefit
+
+Before this change, running `strings <agent>` on any NaxDarks binary revealed the pre-profile defaults (`/news/feed`, `/api/submit`, `X-Beacon-Id`, `Mozilla/5.0...`, `dbus-daemon`) as static IOCs that could identify the implant. These strings are now:
+
+1. **Not in the binary** — generated per-byte at runtime
+2. **Operator-configurable** — set when creating the listener, not hardcoded in source
+3. **Unique per deployment** — different operators use different values
 
 ---
 
@@ -207,4 +232,6 @@ The exit is indistinguishable from a normal process termination. No error messag
 
 - **Implementation:** `nax_linux/src/Opsec/opsec.c`
 - **Header:** `nax_linux/include/opsec.h`
+- **Pre-profile config:** `nax_linux/include/nax_config.h` (auto-generated)
+- **Config generator:** `agent_naxdarks_linux/pl_main.go` → `BuildPayload()`
 - **Build flag:** `NAX_OPSEC=1` in Makefile or OPSEC checkbox in Adaptix UI

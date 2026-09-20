@@ -1,4 +1,6 @@
-/* Este es solo un cargador de prueba */
+/* Template loader. Modify this for custom deployment techniques.
+ * The default agent stub (src/stub/stub.c) is separate and should
+ * not be modified. Use this as a starting point for your own loader. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
