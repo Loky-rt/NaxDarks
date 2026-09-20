@@ -42,6 +42,11 @@ sudo dpkg --add-architecture arm64 && sudo apt-get install libssl-dev:arm64
 ### Deploy
 
 ```bash
+./dist/axtool adaptix.spec ext install /path/to/NaxDarks [-f] [-d]
+```
+>> From the root of the Adaptix repository
+
+```bash
 # Full install
 bash setup_nax.sh --server /path/to/adaptixserver/dist
 
