@@ -55,11 +55,11 @@ bash setup_nax.sh --server /path/to/adaptixserver/dist --action agent-linux
 bash setup_nax.sh --server /path/to/adaptixserver/dist --action listener-linux-tcp
 bash setup_nax.sh --server /path/to/adaptixserver/dist --action listener-linux-https
 
->> From the root of the NaxDarks repository
-
 # Check prerequisites
 bash setup_nax.sh --server /path/to/adaptixserver/dist --action prereqs
 ```
+
+>> From the root of the NaxDarks repository
 
 ## Commands
 
