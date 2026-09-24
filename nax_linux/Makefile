@@ -132,6 +132,7 @@ endif
 ifeq ($(NAX_DEBUG),1)
   CFLAGS  += -DNAX_DEBUG -g -O0
   SUFFIX  := $(SUFFIX)_debug
+  NAX_STUB := 0
 endif
 
 # ===== format =====

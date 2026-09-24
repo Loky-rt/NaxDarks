@@ -20,11 +20,14 @@ Forget depending on Python or Bash on the target machine. NaxDarks executes comp
 - **Multi-architecture** - x86_64 and ARM64
 - **AES-128-CBC encryption** - all frames encrypted end-to-end
 - **SOCKS4/5 proxy** and **reverse port forwarding** via Adaptix tunnel system
-- **In-memory execution** - fileless loader via `memfd_create`
 - **BOF execution** - In-memory execution of C object files (.o) with full Beacon-compatible API
 - **Asynchronous BOFs** - background execution via threading, cooperative cancellation, and job management
 - **OPSEC** - anti-debug, anti-VM, and self-destruct capabilities (compile-time optional)
 - **Sleep Obfuscation** - Sensitive data only (Transport HTTPS)
+- **Proxy-aware** - auto-detects system HTTP proxy and tunnels through HTTP CONNECT with Basic auth support
+- **Stub packer** - ELF agent wrapped in encrypted loader, fileless execution via `O_TMPFILE + execveat`, `kernel keyring`, or `memfd_create` fallback
+- **.rodata encryption** - XOR-encrypted string table for .so builds, decrypted at load time
+- **Configurable pre-profile** - GET/POST URIs, headers and User-Agent set per listener
 
 ## Quick Start
 

