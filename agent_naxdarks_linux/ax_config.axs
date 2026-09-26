@@ -203,7 +203,7 @@ function RegisterCommands(listenerType)
     let cmd_unlink = ax.create_command("unlink", "Disconnect a linked pivot agent", "unlink {pivot_id}", "Queuing unlink...");
     cmd_unlink.addArgString("pivot_id", true, "Pivot ID (8-char hex shown in link result, e.g. 00000021)");
 
-    let group = ax.create_commands_group("NAX-Linux", [
+    let group = ax.create_commands_group("NaxDarks-Linux", [
         cmd_whoami, cmd_pwd, cmd_env,
         cmd_cd,
         cmd_ls, cmd_cat, cmd_mkdir, cmd_rmdir, cmd_rm,

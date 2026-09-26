@@ -45,7 +45,7 @@ extenders:
         - python3
         - make
     build:
-      - 'find /home /opt /srv /mnt /tmp -type d -name NaxDarks ! -path "*/AdaptixC2/*" -printf "%T@ %p\n" 2>/dev/null | sort -nr | head -n 1 | cut -d" " -f2- > nax_root.conf'
+      - 'find /home /opt /srv /mnt /tmp -type d -name NaxDarks* ! -path "*/AdaptixC2/*" -printf "%T@ %p\n" 2>/dev/null | sort -nr | head -n 1 | cut -d" " -f2- > nax_root.conf'
       - go build -buildmode=plugin -o agent_naxdarks_linux.so .
     release:
       globs:
