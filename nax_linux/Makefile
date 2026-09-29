@@ -34,6 +34,7 @@ NAX_JITTER_PCT  ?= 0
 NAX_STUB        ?= 1
 
 RODATA_CRYPT    := src/stub/rodata_crypt.py
+comma           := ,
 STUB_DIR        := src/stub
 STUB_SRC        := $(STUB_DIR)/stub.c
 STUB_PAYLOAD    := $(STUB_DIR)/stub_payload.h
@@ -140,6 +141,7 @@ ifeq ($(NAX_FORMAT),so)
   SRCS   += src/shared.c
   CFLAGS := $(subst -fPIE,-fPIC,$(CFLAGS))
   LDFLAGS := $(subst -pie,-shared,$(LDFLAGS))
+  LDFLAGS := $(subst -Wl$(comma)-Bstatic -lpthread -lz -Wl$(comma)-Bdynamic,-lpthread -lz,$(LDFLAGS))
   SUFFIX := $(SUFFIX).so
   RODATA_ENCRYPT := 1
 else

