@@ -18,6 +18,7 @@ import (
 	"time"
 
 	adaptix "github.com/Adaptix-Framework/axc2/v2"
+	"golang.org/x/net/http2"
 )
 
 func base64Decode(s string) ([]byte, error) {
@@ -250,7 +251,13 @@ func (s *httpServer) start() error {
 		}
 		s.srv.TLSConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
-			NextProtos:   []string{"http/1.1"},
+			NextProtos:   []string{"h2"},
+		}
+		if err := http2.ConfigureServer(s.srv, &http2.Server{
+			MaxConcurrentStreams: 250,
+		}); err != nil {
+			s.srv = nil
+			return fmt.Errorf("listener: HTTP/2 configure: %w", err)
 		}
 		go func() { _ = s.srv.ListenAndServeTLS("", "") }()
 	} else {
@@ -525,10 +532,8 @@ func (s *httpServer) writeServerResponse(w http.ResponseWriter, tx *HTTPTransact
 	} else {
 		w.Header().Set("Content-Type", "application/octet-stream")
 	}
-	// Explicit Content-Length prevents chunked transfer encoding,
-	// which confuses pre-profile agents that parse the response manually.
-	w.Header().Set("Content-Length", strconv.Itoa(len(encoded)))
-	w.Header().Set("Connection", "keep-alive")
+	// HTTP/2 frames own their own length — do not set Content-Length or
+	// Connection (both are forbidden in HTTP/2 per RFC 9113 §8.2.2).
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(encoded)
 }
@@ -544,8 +549,6 @@ func (s *httpServer) writeNoTasks(w http.ResponseWriter, tx *HTTPTransaction) {
 		} else {
 			w.Header().Set("Content-Type", "application/octet-stream")
 		}
-		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(body)
 		return

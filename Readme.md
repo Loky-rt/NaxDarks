@@ -14,7 +14,7 @@ Forget depending on Python or Bash on the target machine. NaxDarks executes comp
 
 ## Features
 
-- **HTTPS transport** - malleable C2 profile v2 with URI and host rotation, configurable sleep and jitter
+- **HTTPS transport** - malleable C2 profile v2 with URI and host rotation, configurable sleep and jitter; HTTP/2 via libcurl
 - **TCP transport** - connect-out and bind/pivot modes
 - **Multi-hop pivoting** - chain multiple Linux TCP bind agents through a single HTTPS parent
 - **Multi-architecture** - x86_64 and ARM64
@@ -35,12 +35,15 @@ Forget depending on Python or Bash on the target machine. NaxDarks executes comp
 
 ```bash
 # Required
-sudo apt-get install gcc golang libssl-dev
+sudo apt-get install gcc golang libcurl4-openssl-dev
 
 # Optional — ARM64 cross-compilation
 sudo apt-get install gcc-aarch64-linux-gnu
-sudo dpkg --add-architecture arm64 && sudo apt-get install libssl-dev:arm64
+sudo dpkg --add-architecture arm64
+sudo apt-get install -o Dpkg::Options::="--force-overwrite" libcurl4-openssl-dev:arm64
 ```
+
+> **Note:** The HTTPS transport uses libcurl (replaces the previous OpenSSL-based implementation), enabling HTTP/2, system proxy detection (`https_proxy` / `HTTPS_PROXY`), and Basic/NTLM proxy authentication out of the box.
 
 ### Deploy
 

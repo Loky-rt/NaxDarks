@@ -40,7 +40,7 @@ extenders:
       apt:
         - gcc
         - gcc-aarch64-linux-gnu
-        - libssl-dev
+        - libcurl4-openssl-dev
         - zlib1g-dev
         - python3
         - make

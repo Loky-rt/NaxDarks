@@ -90,21 +90,21 @@ else ifeq ($(NAX_TCP_MODE),https)
              src/Commands/zip.c \
              src/Transport/https.c \
              src/Transport/https_profile.c
-  ifneq ($(OPENSSL_INC),)
-    CFLAGS += -I$(OPENSSL_INC)
+  # libcurl (replaces hand-rolled OpenSSL TLS/HTTP).
+  # Uses pkg-config when available; falls back to -lcurl.
+  # For cross-compile set CURL_CFLAGS / CURL_LIBS manually, e.g.:
+  #   make NAX_TCP_MODE=https CC=aarch64-linux-gnu-gcc \
+  #        CURL_CFLAGS="-I/usr/include/aarch64-linux-gnu" \
+  #        CURL_LIBS="-L/usr/lib/aarch64-linux-gnu -lcurl"
+  ifeq ($(CURL_LIBS),)
+    CURL_LIBS  := $(shell pkg-config --libs   libcurl 2>/dev/null || echo -lcurl)
   endif
-  ifeq ($(CC),aarch64-linux-gnu-gcc)
-    OPENSSL_TRIPLET := aarch64-linux-gnu
-  else
-    OPENSSL_TRIPLET :=
+  ifeq ($(CURL_CFLAGS),)
+    CURL_CFLAGS := $(shell pkg-config --cflags libcurl 2>/dev/null)
   endif
-  ifneq ($(OPENSSL_TRIPLET),)
-    CFLAGS       += -I/usr/include/$(OPENSSL_TRIPLET)
-    LDFLAGS       = -pie -Wl,-Bstatic -lpthread -lz -Wl,-Bdynamic \
-                    -L/usr/lib/$(OPENSSL_TRIPLET) -lssl -lcrypto -Wl,-z,relro,-z,now -Wl,-z,noexecstack
-  else
-    LDFLAGS       = -pie -Wl,-Bstatic -lpthread -lz -Wl,-Bdynamic -lssl -lcrypto -Wl,-z,relro,-z,now -Wl,-z,noexecstack
-  endif
+  CFLAGS  += $(CURL_CFLAGS)
+  LDFLAGS  = -pie -Wl,-Bstatic -lpthread -lz -Wl,-Bdynamic \
+             $(CURL_LIBS) -Wl,-z,relro,-z,now -Wl,-z,noexecstack
   LDFLAGS_EXTRA :=
 else
   CFLAGS  += -DNAX_C2_HOST=\"$(NAX_C2_HOST)\" \

