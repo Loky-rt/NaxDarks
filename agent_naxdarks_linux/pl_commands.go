@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"math/rand"
 	"strconv"
-//	"strings"
+	"strings"
 	"sync"
 
 	adaptix "github.com/Adaptix-Framework/axc2/v2"
@@ -46,7 +46,8 @@ const (
 	CMD_BOF_ASYNC    byte = 0x51
 	CMD_BOF_JOBS     byte = 0x52
 	CMD_BOF_KILL     byte = 0x53
-	CMD_PROFILE_UPDATE byte = 0x3A
+	CMD_PROFILE_UPDATE    byte = 0x3A
+	CMD_DOWNLOAD_CANCEL   byte = 0x2D
 )
 
 const (
@@ -94,6 +95,21 @@ func CreateCommand(agentData adaptix.AgentData, args map[string]any) (adaptix.Ta
 
 	case "env":
 		return simpleCmd(CMD_ENV), adaptix.ConsoleMessageData{}, nil
+
+	case "download_cancel":
+		taskIdStr, _ := args["task_id"].(string)
+		if taskIdStr == "" {
+			return adaptix.TaskData{}, adaptix.ConsoleMessageData{}, fmt.Errorf("download_cancel: task_id required")
+		}
+		var taskId uint32
+		fmt.Sscanf(taskIdStr, "%d", &taskId)
+		buf := make([]byte, 4)
+		binary.LittleEndian.PutUint32(buf, taskId)
+		data := make([]byte, 1+4+4)
+		data[0] = CMD_DOWNLOAD_CANCEL
+		binary.LittleEndian.PutUint32(data[1:], uint32(len(buf)))
+		copy(data[5:], buf)
+		return adaptix.TaskData{Type: adaptix.TASK_TYPE_TASK, Sync: true, Data: data}, adaptix.ConsoleMessageData{}, nil
 
 	case "sleep":
 		// sleep <seconds> [jitter%] — operator passes seconds, agent receives ms
@@ -161,8 +177,24 @@ func CreateCommand(agentData adaptix.AgentData, args map[string]any) (adaptix.Ta
 		if path == "" {
 			return adaptix.TaskData{}, adaptix.ConsoleMessageData{}, fmt.Errorf("download: path required")
 		}
-		task := pathCmd(CMD_DOWNLOAD, path)
-		return task, adaptix.ConsoleMessageData{}, nil
+		// chunk_size: optional, e.g. "2mb", "512kb", "4kb". 0 = agent default (512 KB).
+		// Accepted suffixes (case-insensitive): mb, kb. No suffix = bytes.
+		// Clamped by agent to [4 KB .. 10 MB].
+		chunkSize := uint32(0)
+		if cs, ok := args["chunk_size"].(string); ok && cs != "" {
+			chunkSize = parseChunkSize(cs)
+		}
+		// args layout: [chunk_size(4LE)][path_len(4LE)][path]
+		// frame layout: [CMD_DOWNLOAD(1)][argsLen(4LE)][args]
+		pathPacked := packString(path)                        // [path_len(4LE)][path]
+		args := make([]byte, 4+len(pathPacked))
+		binary.LittleEndian.PutUint32(args[0:], chunkSize)   // chunk_size first
+		copy(args[4:], pathPacked)                            // then len-prefixed path
+		data := make([]byte, 1+4+len(args))
+		data[0] = CMD_DOWNLOAD
+		binary.LittleEndian.PutUint32(data[1:], uint32(len(args)))
+		copy(data[5:], args)
+		return adaptix.TaskData{Type: adaptix.TASK_TYPE_TASK, Sync: true, Data: data}, adaptix.ConsoleMessageData{}, nil
 
 	case "upload":
 		remotePath, _ := args["path"].(string)
@@ -610,4 +642,27 @@ func PivotPackData(pivotId string, data []byte) (adaptix.TaskData, error) {
 		Data:   buf,
 		Sync:   false,
 	}, nil
+}
+
+// parseChunkSize parses a human-readable chunk size string into bytes.
+// Examples: "2mb" → 2097152, "512kb" → 524288, "4kb" → 4096, "65536" → 65536.
+// Returns 0 on parse failure (agent will use its default).
+func parseChunkSize(s string) uint32 {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var n uint32
+	var suffix string
+	_, err := fmt.Sscanf(s, "%d%s", &n, &suffix)
+	if err != nil {
+		// No suffix — try plain number
+		fmt.Sscanf(s, "%d", &n)
+		return n
+	}
+	switch suffix {
+	case "mb", "m":
+		return n * 1024 * 1024
+	case "kb", "k":
+		return n * 1024
+	default:
+		return n
+	}
 }

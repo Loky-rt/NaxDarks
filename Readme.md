@@ -80,7 +80,8 @@ bash setup_nax.sh --server /path/to/adaptixserver/dist --action prereqs
 | `mkdir` | Create directory |
 | `rmdir` | Remove empty directory |
 | `rm` | Delete file |
-| `download` | Download file from target |
+| `download` | Download file from target (Async) |
+| `download_cancel` | Cancel an active download by task ID |
 | `upload` | Upload file to agent machine |
 | `shell` | Execute via `/bin/sh -c` |
 | `ps` | List running processes |

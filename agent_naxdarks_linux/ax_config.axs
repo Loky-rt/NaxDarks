@@ -113,8 +113,12 @@ function RegisterCommands(listenerType)
     let cmd_rm = ax.create_command("rm", "Delete file", "rm /tmp/file.txt", "Deleting...");
     cmd_rm.addArgString("path", true, "Path");
 
-    let cmd_download = ax.create_command("download", "Download file from target", "download /etc/shadow", "Downloading...");
-    cmd_download.addArgString("path", true, "Remote path");
+    let cmd_download = ax.create_command("download", "Download file from target", "download /etc/shadow 2mb", "Downloading...");
+    cmd_download.addArgString("path",       true,  "Remote path");
+    cmd_download.addArgString("chunk_size", false, "Chunk size per heartbeat: e.g. 512kb, 2mb (default: 512kb, range: 4kb–10mb - In TCP transport, it is limited to a maximum of 256 KB.)");
+
+    let cmd_download_cancel = ax.create_command("download_cancel", "Cancel an active download by task ID", "download_cancel 42", "Cancelling...");
+    cmd_download_cancel.addArgString("task_id", true, "Task ID of the download to cancel (shown in download list)");
 
     let cmd_upload = ax.create_command("upload", "Upload a local file to the agent machine", "upload {file} {path}", "Uploading...");
     cmd_upload.addArgFile("file",   true, "Local file to upload");
@@ -207,7 +211,7 @@ function RegisterCommands(listenerType)
         cmd_whoami, cmd_pwd, cmd_env,
         cmd_cd,
         cmd_ls, cmd_cat, cmd_mkdir, cmd_rmdir, cmd_rm,
-        cmd_download, cmd_upload,
+        cmd_download, cmd_download_cancel, cmd_upload,
         cmd_shell,
         cmd_ps, cmd_kill,
         cmd_ifconfig,

