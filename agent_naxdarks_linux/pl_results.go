@@ -213,6 +213,11 @@ func ProcessData(agentData adaptix.AgentData, decryptedData []byte) error {
 						displayText = fmt.Sprintf("link: server error: %v", linkErr)
 					} else if childAgentId != 0 {
 						_ = Ts.TsPivotCreate(taskIdStr, agentData.Id, childAgentId, "", false)
+						// Clear "Unlink" mark set by TsPivotDelete on previous disconnect
+						emptyMark := ""
+						_ = Ts.TsAgentUpdateDataPartial(childAgentId, struct {
+							Mark *string `json:"mark"`
+						}{Mark: &emptyMark})
 						if linkType == 2 {
 							displayText = fmt.Sprintf("----- New TCP pivot agent: [%d]===[%d] (pivot: %s) -----",
 								agentData.Id, childAgentId, taskIdStr)

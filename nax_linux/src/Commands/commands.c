@@ -976,11 +976,19 @@ static uint8_t cmd_unlink(NaxAgent *a, NaxTask *t,
     NaxPivot *p = pivot_find(a, pivot_id);
     if (p) {
         pivot_remove(a, pivot_id);
-        const char *msg = "unlink: child pivot disconnected";
-        *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
+        /* Result wire format: [pivot_id(4LE)][pivot_type(1)]
+         * pivot_type=2 means TCP — matches beacon agent convention.
+         * pl_results.go CMD_UNLINK parses this to call TsPivotDelete. */
+        uint8_t *res = (uint8_t *)malloc(5);
+        if (res) {
+            res[0] = (uint8_t)(pivot_id);        res[1] = (uint8_t)(pivot_id >> 8);
+            res[2] = (uint8_t)(pivot_id >> 16);  res[3] = (uint8_t)(pivot_id >> 24);
+            res[4] = 2; /* TCP pivot type */
+            *out = res; *out_len = 5;
+        }
     } else {
         const char *msg = "unlink: pivot not found";
-        *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
+        *out = (uint8_t *)strdup(msg); *out_len = (uint32_t)strlen(msg);
     }
     return NAX_STATUS_OK;
 }
