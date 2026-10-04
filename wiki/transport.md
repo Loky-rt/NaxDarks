@@ -9,7 +9,7 @@ NaxDarks supports three transport modes, selected at compile time. Each mode pro
 | Mode | Flag | Binary suffix | Direction | Use case |
 |------|------|---------------|-----------|----------|
 | **HTTPS** | `NAX_TCP_MODE=https` | `_https` | Agent → C2 | Primary transport with malleable profiles |
-| **TCP Connect-out** | `NAX_TCP_MODE=connect` | _(none)_ | Agent → C2 | Direct TCP, interactive |
+| **TCP Connect-out** | `NAX_TCP_MODE=connect` | _(none)_ | Agent → C2 | Direct TCP with TLS, configurable sleep |
 | **TCP Bind** | `NAX_TCP_MODE=bind` | `_bind` | Parent → Agent | Pivoting through chained agents |
 
 ```
@@ -65,10 +65,33 @@ Agent                                    C2 Server
   └── sleep (with jitter) ──── loop ────────┘
 ```
 
+### Pre-profile and Post-profile
+
+The HTTPS transport operates in two distinct phases:
+
+**Pre-profile (bootstrap):** Before the agent receives a malleable profile, it uses hardcoded defaults to register with the C2:
+
+| Parameter | Value |
+|-----------|-------|
+| URI | Configured in the listener (`pre_post_uri`) |
+| Beacon ID header | `X-Beacon-Id` (or configured `pre_beacon_hdr`) |
+| Body encoding | Raw AES-CBC, no masking |
+| Method | POST |
+
+The server responds with the full malleable profile (PROFILE frame), which the agent applies immediately.
+
+**Post-profile:** All subsequent requests (heartbeats, results) use the profile's URIs, headers, encoding, and masking pipeline. See [Malleable C2 Profiles](Malleable-C2-Profiles.md).
+
+> **Redirector configuration — common failure point**
+>
+> When using redirectors (e.g. Apache, nginx, Cloudflare Workers) in front of the C2, **both the pre-profile URI and all post-profile URIs must be forwarded** to the C2 server.
+>
+> A common mistake is configuring the redirector to only forward the post-profile URIs from the malleable profile, forgetting that the agent's first request uses a different URI (the pre-profile one). This causes the REGISTER to return 404/403 and the agent never connects.
+>
+> **Example:** If the listener is configured with `pre_post_uri = /api/submit` and the malleable profile uses `/api/v1/telemetry` and `/api/v1/verify`, the redirector must forward **all three**.
+
 ### Key behaviors
 
-- **Pre-profile bootstrap:** The first POST always uses hardcoded defaults (`/api/submit`, `X-Beacon-Id` header, raw AES body). The server responds with the PROFILE frame.
-- **Post-profile:** All subsequent requests use the profile's URIs, headers, encoding, and masking. See [Malleable C2 Profiles](Malleable-C2-Profiles.md).
 - **Host rotation:** The `hosts` array in the profile supports `sequential` or `random` rotation. On connection failure, the agent rotates immediately.
 - **Sleep and jitter:** Configurable at build time and via the `sleep` command at runtime. Jitter adds ±N% randomness to the interval.
 - **Reconnect:** On TLS or HTTP failure, the agent closes the connection, rotates to the next host, and retries with a 3-second backoff.
@@ -84,31 +107,36 @@ Agent                                    C2 Server
 
 ## TCP Connect-out
 
-Direct TCP connection to the C2 server. Simpler than HTTPS — no TLS, no profiles, no sleep.
+Direct TCP connection to the C2 server with TLS 1.2+ encryption (OpenSSL). No malleable profiles — uses a fixed wire format.
 
 ### Connection flow
 
 ```
 Agent                                    C2 Server
   │                                         │
-  ├── TCP connect ─────────────────────────▶│
+  ├── TCP connect + TLS handshake ─────────▶│
   │                                         │
   ├── [len][beat] ─────────────────────────▶│  REGISTER beat
   │   beat = [wm(4)][session_id(16)][AES(register)]
+  │                                         │
+  ├── sleep(configured_ms ± jitter) ────────│
+  │                                         │
+  ├── [len][AES(heartbeat)] ───────────────▶│  HEARTBEAT
   │                                         │
   │◀── [len][AES(tasks)] ──────────────────│  TASKS or NO_TASKS
   │                                         │
   ├── [len][AES(result)] ──────────────────▶│  RESULT
   │                                         │
-  └── recv blocks (no sleep) ── loop ───────┘
+  └── sleep ── loop ────────────────────────┘
 ```
 
 ### Key behaviors
 
-- **No sleep:** The agent sends a heartbeat and blocks on `recv()` until the server responds. The server controls the timing.
+- **TLS:** All traffic is wrapped in TLS 1.2+ via OpenSSL. The agent connects as a TLS client without certificate validation (`SSL_VERIFY_NONE`). The listener requires a certificate and private key configured at creation time.
+- **Sleep and jitter:** Configurable at build time and via the `sleep` command at runtime. Set `sleep 0` for interactive use (e.g. active SOCKS tunnels).
 - **Watchdog:** A 30-second `SO_RCVTIMEO` acts as a watchdog — if the server doesn't respond, the agent reconnects.
-- **Reconnect:** On any socket error, the agent closes, waits 2 seconds, and reconnects.
-- **Wire format:** All messages are length-prefixed: `[4-byte LE length][data]`.
+- **Reconnect:** On any socket or TLS error, the agent closes, waits 2 seconds, and reconnects.
+- **Wire format:** All messages are length-prefixed: `[4-byte LE length][TLS(AES(data))]`.
 
 ### Files
 

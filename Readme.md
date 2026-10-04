@@ -14,32 +14,42 @@ Forget depending on Python or Bash on the target machine. NaxDarks executes comp
 
 ## Features
 
-- **HTTPS transport** - malleable C2 profile v2 with URI and host rotation, configurable sleep and jitter
-- **TCP transport** - connect-out and bind/pivot modes
+- **HTTPS transport** - malleable C2 profile v2 with URI and host rotation, configurable sleep and jitter; HTTP/2 via libcurl
+- **TCP transport** - connect-out (TLS 1.2+) and bind/pivot modes
 - **Multi-hop pivoting** - chain multiple Linux TCP bind agents through a single HTTPS parent
 - **Multi-architecture** - x86_64 and ARM64
 - **AES-128-CBC encryption** - all frames encrypted end-to-end
 - **SOCKS4/5 proxy** and **reverse port forwarding** via Adaptix tunnel system
-- **In-memory execution** - fileless loader via `memfd_create`
 - **BOF execution** - In-memory execution of C object files (.o) with full Beacon-compatible API
 - **Asynchronous BOFs** - background execution via threading, cooperative cancellation, and job management
 - **OPSEC** - anti-debug, anti-VM, and self-destruct capabilities (compile-time optional)
 - **Sleep Obfuscation** - Sensitive data only (Transport HTTPS)
+- **Proxy-aware** - auto-detects system HTTP proxy and tunnels through HTTP CONNECT with Basic auth support
+- **Stub packer** - ELF agent wrapped in encrypted loader, fileless execution via `O_TMPFILE + execveat`, `kernel keyring`, or `memfd_create` fallback
+- **.rodata encryption** - XOR-encrypted string table for .so builds, decrypted at load time
+- **Configurable pre-profile** - GET/POST URIs, headers and User-Agent set per listener
 
 ## Quick Start
 
 ### Prerequisites
 
-```bash
-# Required
-sudo apt-get install gcc golang libssl-dev
+x86_64 dependencies are installed automatically by `axtool` on deploy. For ARM64 cross-compilation, run the following **once** on the server before installing:
 
-# Optional — ARM64 cross-compilation
+```bash
 sudo apt-get install gcc-aarch64-linux-gnu
-sudo dpkg --add-architecture arm64 && sudo apt-get install libssl-dev:arm64
+sudo dpkg --add-architecture arm64
+sudo apt-get update
+sudo apt-get install -o Dpkg::Options::="--force-overwrite" \
+    libcurl4-openssl-dev:arm64 \
+    libssl-dev:arm64
 ```
 
 ### Deploy
+
+```bash
+./dist/axtool adaptix.spec ext install /path/to/NaxDarks [-f] [-d]
+```
+>> From the root of the Adaptix repository
 
 ```bash
 # Full install
@@ -54,6 +64,8 @@ bash setup_nax.sh --server /path/to/adaptixserver/dist --action listener-linux-h
 bash setup_nax.sh --server /path/to/adaptixserver/dist --action prereqs
 ```
 
+>> From the root of the NaxDarks repository
+
 ## Commands
 
 | Command | Description |
@@ -67,14 +79,15 @@ bash setup_nax.sh --server /path/to/adaptixserver/dist --action prereqs
 | `mkdir` | Create directory |
 | `rmdir` | Remove empty directory |
 | `rm` | Delete file |
-| `download` | Download file from target |
+| `download` | Download file from target (Async) |
+| `download_cancel` | Cancel an active download by task ID |
 | `upload` | Upload file to agent machine |
 | `shell` | Execute via `/bin/sh -c` |
 | `ps` | List running processes |
 | `kill` | Kill process by PID |
 | `ifconfig` | Show network interfaces |
 | `zip` | Compress file or directory into ZIP |
-| `sleep` | Set beacon sleep interval in seconds (HTTPS only) |
+| `sleep` | Set beacon sleep interval in seconds (HTTPS and TCP connect-out) |
 | `bof` | Execute an ELF BOF (.o file) in-memory |
 | `exit` | Terminate the agent |
 | `socks` | Manage SOCKS proxy tunnel |
@@ -102,100 +115,11 @@ Full malleable C2 profile v2 support — configurable encoding, URI and host rot
 
 ### TCP Connect-out
 
-Direct connection to the Adaptix Linux TCP listener. Sleep intervals are not configurable in this mode.
+Direct connection to the Adaptix Linux TCP listener. TLS 1.2+ encrypted via OpenSSL. Configurable sleep and jitter — set to 0 for interactive use (SOCKS tunnels).
 
 ### TCP Bind (Pivot)
 
 The agent listens on a local port, allowing a parent agent to connect inbound. Supports pivot chains of arbitrary depth. All child traffic is relayed by the parent during its normal beacon cycle.
-
-## Project Structure
-
-```bash
-NaxDarks
-├── agent_naxdarks_linux
-│   ├── ax_config.axs
-│   ├── bof_args.go
-│   ├── config.yaml
-│   ├── go.mod
-│   ├── go.sum
-│   ├── pl_agent.go
-│   ├── pl_commands.go
-│   ├── pl_crypto.go
-│   ├── pl_format.go
-│   ├── pl_main.go
-│   ├── pl_profile.go
-│   ├── pl_results.go
-│   ├── pl_tunnels.go
-│   └── pl_wire.go
-├── nax_linux
-│   ├── deps
-│   │   └── elf-bof
-│   │       ├── include
-│   │       │   ├── bof_api.h
-│   │       │   ├── bof_async.h
-│   │       │   ├── elf_bof.h
-│   │       │   └── nax_bof_sdk.h
-│   │       └── lib
-│   │           ├── libelf_bof_arm64.a
-│   │           └── libelf_bof_x64.a
-│   ├── include
-│   │   ├── commands.h
-│   │   ├── nax_config.h
-│   │   ├── nax_linux.h
-│   │   ├── opsec.h
-│   │   └── sysinfo.h
-│   ├── Makefile
-│   └── src
-│       ├── Commands
-│       │   ├── commands.c
-│       │   ├── tunnel.c
-│       │   └── zip.c
-│       ├── Core
-│       │   ├── crypto.c
-│       │   ├── packer.c
-│       │   └── sysinfo.c
-│       ├── Loader
-│       │   └── memfd_loader.c
-│       ├── main.c
-│       ├── Opsec
-│       │   └── opsec.c
-│       └── Transport
-│           ├── https.c
-│           ├── https_profile.c
-│           ├── tcp_bind.c
-│           └── tcp.c
-├── profiles
-│   ├── aws-cloudfront.json
-│   ├── jquery-stealth.json
-│   └── microsoft-graph.json
-├── Readme.md
-├── setup_nax.sh
-├── src_server
-│   ├── listener_naxdarks_linux_https
-│   │   ├── ax_config.axs
-│   │   ├── config.yaml
-│   │   ├── go.mod
-│   │   ├── go.sum
-│   │   ├── pl_crypto.go
-│   │   ├── pl_http.go
-│   │   ├── pl_http_profile.go
-│   │   ├── pl_http_profile_store.go
-│   │   ├── pl_http_transform.go
-│   │   ├── pl_main.go
-│   │   └── pl_wire.go
-│   ├── listener_naxdarks_linux_tcp
-│   │   ├── ax_config.axs
-│   │   ├── config.yaml
-│   │   ├── go.mod
-│   │   ├── go.sum
-│   │   └── pl_main.go
-│   └── Makefile
-└── wiki
-    ├── Malleable-C2-Profiles.md
-    ├── opsec.md
-    ├── register_commands.md
-    └── transport.md
-```
 
 ---
 

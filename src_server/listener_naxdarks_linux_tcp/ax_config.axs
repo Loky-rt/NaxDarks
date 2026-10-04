@@ -56,19 +56,35 @@ function ListenerUI(mode_create)
         textKey.setText(ax.random_string(32, "hex"));
     });
 
+    // ===== TLS Certificate =====
+
+    let labelCert  = form.create_label("TLS Certificate:");
+    let certSelector = form.create_selector_file();
+    certSelector.setPlaceholder("SSL certificate (.crt / .pem)");
+    certSelector.setEnabled(mode_create);
+
+    let labelKey2  = form.create_label("TLS Private Key:");
+    let keySelector = form.create_selector_file();
+    keySelector.setPlaceholder("SSL private key (.key / .pem)");
+    keySelector.setEnabled(mode_create);
+
     // agent_crc hardcodeado — no visible para el operador
     let hiddenCrc = form.create_textline("deadbeef");
 
     let spacer2 = form.create_vspacer();
 
     let layout = form.create_gridlayout();
-    layout.addWidget(spacer1,    0, 0, 1, 3);
-    layout.addWidget(groupBind,  1, 0, 1, 3);
-    layout.addWidget(groupConn,  2, 0, 1, 3);
-    layout.addWidget(labelKey,   3, 0, 1, 1);
-    layout.addWidget(textKey,    3, 1, 1, 1);
-    layout.addWidget(btnKey,     3, 2, 1, 1);
-    layout.addWidget(spacer2,    4, 0, 1, 3);
+    layout.addWidget(spacer1,     0, 0, 1, 3);
+    layout.addWidget(groupBind,   1, 0, 1, 3);
+    layout.addWidget(groupConn,   2, 0, 1, 3);
+    layout.addWidget(labelKey,    3, 0, 1, 1);
+    layout.addWidget(textKey,     3, 1, 1, 1);
+    layout.addWidget(btnKey,      3, 2, 1, 1);
+    layout.addWidget(labelCert,    4, 0, 1, 1);
+    layout.addWidget(certSelector, 4, 1, 1, 2);
+    layout.addWidget(labelKey2,    5, 0, 1, 1);
+    layout.addWidget(keySelector,  5, 1, 1, 2);
+    layout.addWidget(spacer2,     6, 0, 1, 3);
 
     let container = form.create_container();
     container.put("bind_host",   textBindHost);
@@ -76,6 +92,8 @@ function ListenerUI(mode_create)
     container.put("c2_host",     comboC2Host);
     container.put("c2_port",     spinC2Port);
     container.put("encrypt_key", textKey);
+    container.put("ssl_cert",    certSelector);
+    container.put("ssl_key",     keySelector);
     container.put("agent_crc",   hiddenCrc);
 
     let panel = form.create_panel();

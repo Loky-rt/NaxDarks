@@ -60,7 +60,8 @@
 #define NAX_CMD_SHELL        0x28u
 #define NAX_CMD_ENV          0x29u
 #define NAX_CMD_ZIP          0x2Au
-#define NAX_CMD_SLEEP        0x2Cu
+#define NAX_CMD_SLEEP           0x2Cu
+#define NAX_CMD_DOWNLOAD_CANCEL 0x2Du
 #define NAX_CMD_BOF          0x50u
 #define NAX_CMD_BOF_ASYNC    0x51u
 #define NAX_CMD_BOF_JOBS     0x52u
@@ -99,6 +100,26 @@ typedef struct NaxTunnel {
 #define NAX_PIV_TYPE_DATA    0u   /* child data to relay to C2            */
 #define NAX_PIV_TYPE_UNLINK  1u   /* child disconnected                   */
 #define NAX_CMD_UNLINK       0x39u  /* disconnect a child pivot agent */
+
+/* ===== chunked download ===== */
+#define NAX_DL_START    0x01u
+#define NAX_DL_CONTINUE 0x02u
+#define NAX_DL_FINISH   0x03u
+
+#define NAX_DL_CHUNK_DEFAULT (512u * 1024u)   /*  512 KB */
+#define NAX_DL_CHUNK_MIN     (4u   * 1024u)   /*    4 KB */
+#define NAX_DL_CHUNK_MAX     (10u  * 1024u * 1024u) /* 10 MB */
+
+typedef struct NaxDownload {
+    uint32_t          task_id;
+    uint32_t          file_id;
+    int               fd;
+    uint32_t          file_size;
+    uint32_t          bytes_sent;
+    uint32_t          chunk_size;   /* 0 = use NAX_DL_CHUNK_DEFAULT */
+    char              filename[256];
+    struct NaxDownload *next;
+} NaxDownload;
 
 /* ===== crypto ===== */
 #define NAX_AES_KEY_SIZE 16u
@@ -146,16 +167,21 @@ typedef struct NaxPivot {
 
 /* ===== agent instance ===== */
 typedef struct {
-    NaxConfig cfg;
-    int       sock;            /* connected TCP socket to C2 or parent */
-    NaxPivot  *pivot_head;     /* linked list of child pivot connections */
-    NaxTunnel *tunnel_head;    /* linked list of active tunnel channels */
-    char      session_id[NAX_SID_LEN + 1];  /* hex, NUL-terminated */
-    bool      running;
+    NaxConfig   cfg;
+    int         sock;            /* connected TCP socket to C2 or parent */
+    NaxPivot   *pivot_head;      /* linked list of child pivot connections */
+    NaxTunnel  *tunnel_head;     /* linked list of active tunnel channels */
+    NaxDownload *download_head;  /* linked list of active chunked downloads */
+    char        session_id[NAX_SID_LEN + 1];  /* hex, NUL-terminated */
+    bool        running;
     volatile int profile_pending;   /* set by profile_update: skip sleep for 1 cycle */
     uint8_t  *pending_profile_data; /* deferred profile bytes, applied after result POST */
     uint32_t  pending_profile_len;
 } NaxAgent;
+
+/* ===== chunked download relay ===== */
+/* Returns bytes written into out; called each heartbeat cycle */
+extern uint32_t nax_process_downloads(NaxAgent *a, uint8_t *out, uint32_t out_cap);
 
 /* ===== Debug macro ===== */
 #ifdef NAX_DEBUG
