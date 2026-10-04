@@ -15,7 +15,7 @@ Forget depending on Python or Bash on the target machine. NaxDarks executes comp
 ## Features
 
 - **HTTPS transport** - malleable C2 profile v2 with URI and host rotation, configurable sleep and jitter; HTTP/2 via libcurl
-- **TCP transport** - connect-out and bind/pivot modes
+- **TCP transport** - connect-out (TLS 1.2+) and bind/pivot modes
 - **Multi-hop pivoting** - chain multiple Linux TCP bind agents through a single HTTPS parent
 - **Multi-architecture** - x86_64 and ARM64
 - **AES-128-CBC encryption** - all frames encrypted end-to-end
@@ -33,17 +33,16 @@ Forget depending on Python or Bash on the target machine. NaxDarks executes comp
 
 ### Prerequisites
 
-```bash
-# Required
-sudo apt-get install gcc golang libcurl4-openssl-dev
+x86_64 dependencies are installed automatically by `axtool` on deploy. For ARM64 cross-compilation, run the following **once** on the server before installing:
 
-# Optional — ARM64 cross-compilation
+```bash
 sudo apt-get install gcc-aarch64-linux-gnu
 sudo dpkg --add-architecture arm64
-sudo apt-get install -o Dpkg::Options::="--force-overwrite" libcurl4-openssl-dev:arm64
+sudo apt-get update
+sudo apt-get install -o Dpkg::Options::="--force-overwrite" \
+    libcurl4-openssl-dev:arm64 \
+    libssl-dev:arm64
 ```
-
-> **Note:** The HTTPS transport uses libcurl (replaces the previous OpenSSL-based implementation), enabling HTTP/2, system proxy detection (`https_proxy` / `HTTPS_PROXY`), and Basic/NTLM proxy authentication out of the box.
 
 ### Deploy
 
@@ -88,7 +87,7 @@ bash setup_nax.sh --server /path/to/adaptixserver/dist --action prereqs
 | `kill` | Kill process by PID |
 | `ifconfig` | Show network interfaces |
 | `zip` | Compress file or directory into ZIP |
-| `sleep` | Set beacon sleep interval in seconds (HTTPS only) |
+| `sleep` | Set beacon sleep interval in seconds (HTTPS and TCP connect-out) |
 | `bof` | Execute an ELF BOF (.o file) in-memory |
 | `exit` | Terminate the agent |
 | `socks` | Manage SOCKS proxy tunnel |
@@ -116,7 +115,7 @@ Full malleable C2 profile v2 support — configurable encoding, URI and host rot
 
 ### TCP Connect-out
 
-Direct connection to the Adaptix Linux TCP listener. Sleep intervals are not configurable in this mode.
+Direct connection to the Adaptix Linux TCP listener. TLS 1.2+ encrypted via OpenSSL. Configurable sleep and jitter — set to 0 for interactive use (SOCKS tunnels).
 
 ### TCP Bind (Pivot)
 

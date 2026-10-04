@@ -409,7 +409,9 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 		if c2h == "" { c2h = "127.0.0.1" }
 		makeArgs = append(makeArgs, "NAX_TCP_MODE=connect",
 			fmt.Sprintf("NAX_C2_HOST=%s", c2h),
-			fmt.Sprintf("NAX_C2_PORT=%s", listenerC2Port))
+			fmt.Sprintf("NAX_C2_PORT=%s", listenerC2Port),
+			fmt.Sprintf("NAX_SLEEP_MS=%d", sleepMs),
+			fmt.Sprintf("NAX_JITTER_PCT=%d", jitterPct))
 	}
 
 	cmd := exec.Command("make", makeArgs...)

@@ -4,6 +4,8 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -37,10 +39,19 @@ type extenderListener struct {
 	c2Port     int    // port this listener opens for connect-out agents
 	encryptKey []byte
 	agentCrc   string
+	sslCert    []byte
+	sslKey     []byte
 	// TCP server (connect-out mode)
 	server   net.Listener
 	stopChan chan struct{}
 	wg       sync.WaitGroup
+}
+
+func base64Decode(s string) ([]byte, error) {
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	return base64.RawStdEncoding.DecodeString(s)
 }
 
 var (
@@ -113,10 +124,31 @@ func (p *PluginListener) Create(name, config string, customData []byte) (adaptix
 		BindHost:  cfg.BindHost,
 		BindPort:  strconv.Itoa(c2Port),
 		AgentAddr: agentAddr,
-		Protocol:  "bind_tcp",
-		Type:      "internal",
-		Status:    "running",
+		Protocol:  "tcp",
+		Type:      "external",
+		Status:    "stopped",
 		Watermark: "deadbeef",
+	}
+
+	// Parse TLS certificate and key (base64-encoded or PEM)
+	// Use raw map to match HTTPS listener pattern
+	var rawCfg map[string]any
+	var sslCert, sslKey []byte
+	if err := json.Unmarshal([]byte(config), &rawCfg); err == nil {
+		if raw, ok := rawCfg["ssl_cert"].(string); ok && raw != "" {
+			if decoded, err2 := base64Decode(raw); err2 == nil {
+				sslCert = decoded
+			} else {
+				sslCert = []byte(raw)
+			}
+		}
+		if raw, ok := rawCfg["ssl_key"].(string); ok && raw != "" {
+			if decoded, err2 := base64Decode(raw); err2 == nil {
+				sslKey = decoded
+			} else {
+				sslKey = []byte(raw)
+			}
+		}
 	}
 
 	ext := &extenderListener{
@@ -127,6 +159,8 @@ func (p *PluginListener) Create(name, config string, customData []byte) (adaptix
 		c2Port:     c2Port,
 		encryptKey: keyBytes,
 		agentCrc:   agentCrc,
+		sslCert:    sslCert,
+		sslKey:     sslKey,
 	}
 	return ext, listenerData, []byte(config), nil
 }
@@ -135,13 +169,27 @@ func (p *PluginListener) Create(name, config string, customData []byte) (adaptix
 
 func (a *extenderListener) Start() error {
 	if a.c2Host == "" || a.c2Port <= 0 {
-		return nil // pivot-only: no server needed
+		return nil // pivot-only mode: no connect-out server needed
 	}
 	addr := fmt.Sprintf("0.0.0.0:%d", a.c2Port)
 	if a.c2Host != "" && a.c2Host != "0.0.0.0" {
 		addr = fmt.Sprintf("%s:%d", a.c2Host, a.c2Port)
 	}
-	ln, err := net.Listen("tcp", addr)
+
+	// TLS listener — requires ssl_cert and ssl_key in config.
+	// Only required for connect-out mode (c2_port > 0).
+	if len(a.sslCert) == 0 || len(a.sslKey) == 0 {
+		return fmt.Errorf("linux tcp: TLS requires ssl_cert and ssl_key — paste PEM certificate and private key in the listener config")
+	}
+	cert, err := tls.X509KeyPair(a.sslCert, a.sslKey)
+	if err != nil {
+		return fmt.Errorf("linux tcp: TLS certificate error: %w", err)
+	}
+	tlsCfg := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+	ln, err := tls.Listen("tcp", addr, tlsCfg)
 	if err != nil {
 		return fmt.Errorf("linux tcp: Start: %w", err)
 	}
@@ -149,7 +197,7 @@ func (a *extenderListener) Start() error {
 	a.stopChan = make(chan struct{})
 	a.wg.Add(1)
 	go a.acceptLoop()
-	fmt.Printf("[NAX-Linux-TCP] Listening on %s for connect-out agents\n", addr)
+	fmt.Printf("[NAX-Linux-TCP] TLS listening on %s for connect-out agents\n", addr)
 	return nil
 }
 
@@ -250,7 +298,7 @@ func (a *extenderListener) handleConn(conn net.Conn) {
 		}
 		_ = Ts.TsAgentSetTick(agentId, a.name)
 	} else {
-		agentData, err := Ts.TsAgentCreate(a.agentCrc, beaconID, beatWithId, a.name, remoteIP, false)
+		agentData, err := Ts.TsAgentCreate(a.agentCrc, beaconID, beatWithId, a.name, remoteIP, true)
 		if err != nil {
 			fmt.Printf("[NAX-Linux-TCP] TsAgentCreate failed: %v\n", err)
 			return
@@ -302,7 +350,7 @@ func (a *extenderListener) handleConn(conn net.Conn) {
 
 		case wireTypeResult:
 			// Result was processed above via TsAgentProcessData.
-			// Do NOT send a response — agent is not listening for one.
+			// No response needed — agent does not wait for one after sending results.
 
 		default:
 			// Unknown frame — treat as heartbeat to keep agent alive.

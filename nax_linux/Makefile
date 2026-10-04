@@ -115,7 +115,19 @@ else
              src/Commands/tunnel.c \
              src/Commands/zip.c \
              src/Transport/tcp.c
-  LDFLAGS_EXTRA :=
+  # TLS via OpenSSL — same cert-less client pattern as HTTPS transport.
+  # For cross-compile ARM64:
+  #   make NAX_TCP_MODE=tcp CC=aarch64-linux-gnu-gcc \
+  #        SSL_CFLAGS="-I/usr/include/aarch64-linux-gnu" \
+  #        SSL_LIBS="-L/usr/lib/aarch64-linux-gnu -lssl -lcrypto"
+  ifeq ($(SSL_LIBS),)
+    SSL_LIBS  := $(shell pkg-config --libs   openssl 2>/dev/null || echo -lssl -lcrypto)
+  endif
+  ifeq ($(SSL_CFLAGS),)
+    SSL_CFLAGS := $(shell pkg-config --cflags openssl 2>/dev/null)
+  endif
+  CFLAGS      += $(SSL_CFLAGS)
+  LDFLAGS_EXTRA := $(SSL_LIBS)
 endif
 
 # ===== opsec =====

@@ -40,15 +40,25 @@ function GenerateUI(listeners_type)
 
     let spinSleep  = form.create_spin();
     let spinJitter = form.create_spin();
+    spinSleep.setRange(0, 3600);
+    spinSleep.setValue(5);
+    spinJitter.setRange(0, 100);
+    spinJitter.setValue(0);
     if (isHttps) {
-        spinSleep.setRange(0, 3600);
-        spinSleep.setValue(5);
-        spinJitter.setRange(0, 100);
-        spinJitter.setValue(0);
+        // HTTPS: sleep always applies
         tab1.addWidget(form.create_label("Sleep (s):"),  t1r, 0);
         tab1.addWidget(spinSleep,  t1r, 1); t1r++;
         tab1.addWidget(form.create_label("Jitter (%):"), t1r, 0);
         tab1.addWidget(spinJitter, t1r, 1); t1r++;
+    } else {
+        // TCP: sleep applies to connect-out only (ignored in bind/pivot mode)
+        tab1.addWidget(form.create_label("Sleep (s):"),  t1r, 0);
+        tab1.addWidget(spinSleep,  t1r, 1); t1r++;
+        tab1.addWidget(form.create_label("Jitter (%):"), t1r, 0);
+        tab1.addWidget(spinJitter, t1r, 1); t1r++;
+        tab1.addWidget(form.create_label(""), t1r, 0);
+        let noteLabel = form.create_label("(sleep applies to connect mode only)");
+        tab1.addWidget(noteLabel, t1r, 1); t1r++;
     }
 
     let checkInMem = form.create_check("In-Memory (memfd_create — fileless execution)");

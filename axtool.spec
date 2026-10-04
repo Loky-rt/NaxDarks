@@ -41,6 +41,7 @@ extenders:
         - gcc
         - gcc-aarch64-linux-gnu
         - libcurl4-openssl-dev
+        - libssl-dev
         - zlib1g-dev
         - python3
         - make
