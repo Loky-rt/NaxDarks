@@ -1,33 +1,36 @@
 # Installation
 
-NaxDarks supports two installation methods: **axtool** (recommended) and the legacy **setup_nax.sh** script.
+## Prerequisites
+
+Install all build dependencies (x64 + ARM64 cross-compilation):
+
+```bash
+bash install-dep.sh
+```
+
+This installs: `gcc`, `make`, `pkg-config`, `gcc-aarch64-linux-gnu`, `libssl-dev`, `libcurl4-openssl-dev`, `zlib1g-dev` (x64 + arm64).
+
+Go 1.26.5+ is required for the server plugins — install from [go.dev/dl](https://go.dev/dl/).
 
 ---
 
-## axtool (Recommended)
+## Install with axtool (Recommended)
 
-`axtool` is the official Adaptix extension manager. It handles dependency installation, compilation, and deployment in a single command.
-
-### Install
-
-From the root of the Adaptix repository:
+`axtool` is the official Adaptix extension manager. From the root of the Adaptix repository:
 
 ```bash
-./dist/axtool adaptix.spec ext install /path/to/NaxDarks [-f] [-d]
+./dist/axtool adaptix.spec ext install /path/to/NaxDarks [-f]
 ```
 
 | Flag | Description |
 |------|-------------|
 | `-f` | Force reinstall / overwrite existing extension |
-| `-d` | Install apt dependencies declared in `axtool.spec` before building |
 
 **Example:**
 
 ```bash
-./dist/axtool adaptix.spec ext install ~/Downloads/project/NaxDarks -f -d
+./dist/axtool adaptix.spec ext install ~/Downloads/project/NaxDarks -f
 ```
-
-The `-d` flag installs: `gcc`, `gcc-aarch64-linux-gnu`, `libssl-dev`, `zlib1g-dev`, `python3`, `make`.
 
 ### Uninstall
 
@@ -38,19 +41,6 @@ The `-d` flag installs: `gcc`, `gcc-aarch64-linux-gnu`, `libssl-dev`, `zlib1g-de
 ```
 
 The `-c` flag removes compiled artifacts.
-
----
-
-## Legacy: setup_nax.sh
-
-The shell script method remains available.
-
-```bash
-# From the NaxDarks repository root
-bash setup_nax.sh --server /path/to/AdaptixC2/dist
-```
-
-This builds all three plugins (agent + both listeners) and copies them to the Adaptix `dist/extenders/` directory.
 
 ---
 
@@ -70,7 +60,8 @@ This builds all three plugins (agent + both listeners) and copies them to the Ad
 |------|---------|
 | `gcc` | x86_64 agent compilation |
 | `gcc-aarch64-linux-gnu` | ARM64 cross-compilation |
-| `libssl-dev` | TLS for HTTPS transport |
+| `libssl-dev` | TLS for TCP and pivot transports |
+| `libcurl4-openssl-dev` | HTTP/2 HTTPS transport |
 | `zlib1g-dev` | Compression (zip command) |
 | `python3` | Stub payload generation (`gen_stub_payload.py`) |
 | `make` | Build system |

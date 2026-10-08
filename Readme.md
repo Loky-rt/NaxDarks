@@ -33,38 +33,19 @@ Forget depending on Python or Bash on the target machine. NaxDarks executes comp
 
 ### Prerequisites
 
-x86_64 dependencies are installed automatically by `axtool` on deploy. For ARM64 cross-compilation, run the following **once** on the server before installing:
+Install all build dependencies (x64 + ARM64 cross-compilation) by running:
 
 ```bash
-sudo apt-get install gcc-aarch64-linux-gnu
-sudo dpkg --add-architecture arm64
-sudo apt-get update
-sudo apt-get install -o Dpkg::Options::="--force-overwrite" \
-    libcurl4-openssl-dev:arm64 \
-    libssl-dev:arm64
+bash install-dep.sh
 ```
 
 ### Deploy
 
+#### From the root of the Adaptix repository
+
 ```bash
 ./dist/axtool adaptix.spec ext install /path/to/NaxDarks [-f] [-d]
 ```
->> From the root of the Adaptix repository
-
-```bash
-# Full install
-bash setup_nax.sh --server /path/to/adaptixserver/dist
-
-# Individual plugins
-bash setup_nax.sh --server /path/to/adaptixserver/dist --action agent-linux
-bash setup_nax.sh --server /path/to/adaptixserver/dist --action listener-linux-tcp
-bash setup_nax.sh --server /path/to/adaptixserver/dist --action listener-linux-https
-
-# Check prerequisites
-bash setup_nax.sh --server /path/to/adaptixserver/dist --action prereqs
-```
-
->> From the root of the NaxDarks repository
 
 ## Commands
 

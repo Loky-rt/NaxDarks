@@ -40,30 +40,27 @@ function GenerateUI(listeners_type)
 
     let spinSleep  = form.create_spin();
     let spinJitter = form.create_spin();
-    spinSleep.setRange(0, 3600);
-    spinSleep.setValue(5);
-    spinJitter.setRange(0, 100);
-    spinJitter.setValue(0);
     if (isHttps) {
-        // HTTPS: sleep always applies
+        spinSleep.setRange(0, 3600);
+        spinSleep.setValue(5);
+        spinJitter.setRange(0, 100);
+        spinJitter.setValue(0);
         tab1.addWidget(form.create_label("Sleep (s):"),  t1r, 0);
         tab1.addWidget(spinSleep,  t1r, 1); t1r++;
         tab1.addWidget(form.create_label("Jitter (%):"), t1r, 0);
         tab1.addWidget(spinJitter, t1r, 1); t1r++;
-    } else {
-        // TCP: sleep applies to connect-out only (ignored in bind/pivot mode)
-        tab1.addWidget(form.create_label("Sleep (s):"),  t1r, 0);
-        tab1.addWidget(spinSleep,  t1r, 1); t1r++;
-        tab1.addWidget(form.create_label("Jitter (%):"), t1r, 0);
-        tab1.addWidget(spinJitter, t1r, 1); t1r++;
-        tab1.addWidget(form.create_label(""), t1r, 0);
-        let noteLabel = form.create_label("(sleep applies to connect mode only)");
-        tab1.addWidget(noteLabel, t1r, 1); t1r++;
     }
 
-    let checkInMem = form.create_check("In-Memory (memfd_create — fileless execution)");
-    checkInMem.setChecked(false);
-    tab1.addWidget(checkInMem, t1r, 0, 1, 2); t1r++;
+    let labelLoader = form.create_label("Loader technique:");
+    let comboLoader = form.create_combo();
+    comboLoader.addItems([
+        "auto (fallback chain)",
+        "O_TMPFILE + execveat",
+        "kernel keyring",
+        "memfd_create"
+    ]);
+    tab1.addWidget(labelLoader,  t1r, 0);
+    tab1.addWidget(comboLoader,  t1r, 1); t1r++;
 
     let checkOpsec = form.create_check("OPSEC (anti-debug, anti-VM, self-destruct)");
     checkOpsec.setChecked(false);
@@ -86,7 +83,7 @@ function GenerateUI(listeners_type)
     container.put("format",    comboFormat);
     container.put("tcp_mode",  comboMode);
     container.put("debug",     checkDebug);
-    container.put("inmem",     checkInMem);
+    container.put("loader_method", comboLoader);
     container.put("opsec",     checkOpsec);
     container.put("sleep_ms",  spinSleep);
     container.put("jitter_pct", spinJitter);

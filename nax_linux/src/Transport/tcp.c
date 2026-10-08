@@ -474,7 +474,7 @@ static void process_pivots(NaxAgent *a)
             uint8_t lenbuf[4];
             ssize_t got = 0;
             while (got < 4) {
-                ssize_t r = recv(p->sock, lenbuf + got, 4 - got, 0);
+                ssize_t r = p->ssl ? SSL_read((SSL*)p->ssl, lenbuf + got, 4 - got) : recv(p->sock, lenbuf + got, 4 - got, 0);
                 if (r <= 0) { broken = 1; break; }
                 got += r;
             }
@@ -488,7 +488,7 @@ static void process_pivots(NaxAgent *a)
             if (!msg) { broken = 1; break; }
             got = 0;
             while ((uint32_t)got < msg_len) {
-                ssize_t r = recv(p->sock, msg + got, msg_len - (uint32_t)got, 0);
+                ssize_t r = p->ssl ? SSL_read((SSL*)p->ssl, msg + got, (int)(msg_len - (uint32_t)got)) : recv(p->sock, msg + got, msg_len - (uint32_t)got, 0);
                 if (r <= 0) { free(msg); broken = 1; break; }
                 got += r;
             }
@@ -519,6 +519,7 @@ static void process_pivots(NaxAgent *a)
             unlink_data[5] = 2; /* NAX_PIVOT_TYPE_TCP */
             do_send_result(a, 0, NAX_STATUS_OK, unlink_data, sizeof(unlink_data));
 
+            if (p->ssl) { SSL_shutdown((SSL*)p->ssl); SSL_free((SSL*)p->ssl); }
             close(p->sock);
             *pp = p->next;
             free(p);
