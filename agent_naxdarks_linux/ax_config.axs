@@ -7,7 +7,9 @@ var metadata = {
 
 function GenerateUI(listeners_type)
 {
-    let isHttps = listeners_type.includes("NaxDarksHTTPS");
+    let isHttps  = listeners_type.includes("NaxDarksHTTPS");
+    let isGraph  = listeners_type.includes("NaxDarksGraph");
+    let isGitLab = listeners_type.includes("NaxDarksGitLab");
 
     let container = form.create_container();
     let tab1 = form.create_gridlayout();
@@ -28,11 +30,23 @@ function GenerateUI(listeners_type)
     if (isHttps) {
         comboMode.addItems(["https (HTTPS → C2)"]);
         comboMode.setEnabled(false);
+        tab1.addWidget(form.create_label("TCP Mode:"), t1r, 0);
+        tab1.addWidget(comboMode, t1r, 1); t1r++;
+    } else if (isGraph) {
+        comboMode.addItems(["graph (Azure dead-drop)"]);
+        comboMode.setEnabled(false);
+        tab1.addWidget(form.create_label("Transport:"), t1r, 0);
+        tab1.addWidget(comboMode, t1r, 1); t1r++;
+    } else if (isGitLab) {
+        comboMode.addItems(["gitlab (GitLab dead-drop)"]);
+        comboMode.setEnabled(false);
+        tab1.addWidget(form.create_label("Transport:"), t1r, 0);
+        tab1.addWidget(comboMode, t1r, 1); t1r++;
     } else {
         comboMode.addItems(["bind (pivot — wait for parent)", "connect (direct → C2)"]);
+        tab1.addWidget(form.create_label("TCP Mode:"), t1r, 0);
+        tab1.addWidget(comboMode, t1r, 1); t1r++;
     }
-    tab1.addWidget(form.create_label("TCP Mode:"), t1r, 0);
-    tab1.addWidget(comboMode, t1r, 1); t1r++;
 
     let checkDebug = form.create_check("Debug (verbose — print to stderr)");
     checkDebug.setChecked(false);
@@ -40,7 +54,7 @@ function GenerateUI(listeners_type)
 
     let spinSleep  = form.create_spin();
     let spinJitter = form.create_spin();
-    if (isHttps) {
+    if (isHttps || isGraph || isGitLab) {
         spinSleep.setRange(0, 3600);
         spinSleep.setValue(5);
         spinJitter.setRange(0, 100);

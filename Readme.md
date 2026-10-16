@@ -4,7 +4,7 @@
 
 NaxDarks is a Red Team agent for Linux, built for the [Adaptix Framework](https://github.com/Adaptix-Framework/AdaptixC2/tree/main), that brings the flexibility of Beacon Object Files (BOFs) to the Linux ecosystem.
 
-Forget depending on Python or Bash on the target machine. NaxDarks executes compiled C object files (.o) directly in memory using an in-memory ELF loader (mmap + relocate + execute), with a Beacon-style API and native support for asynchronous BOF execution. It includes malleable HTTPS transport, TCP pivoting, and a suite of ready-to-use post-exploitation BOFs.
+Forget depending on Python or Bash on the target machine. NaxDarks executes compiled C object files (.o) directly in memory using an in-memory ELF loader (mmap + relocate + execute), with a Beacon-style API and native support for asynchronous BOF execution. It includes malleable HTTPS transport, TCP pivoting, dead-drop transports via Azure Blob Storage and GitLab, and a suite of ready-to-use post-exploitation BOFs.
 
 ![Language](https://img.shields.io/badge/agent-C-blue)
 ![Language](https://img.shields.io/badge/server-Go-00ADD8)
@@ -16,7 +16,9 @@ Forget depending on Python or Bash on the target machine. NaxDarks executes comp
 
 - **HTTPS transport** - malleable C2 profile v2 with URI and host rotation, configurable sleep and jitter; HTTP/2 via libcurl
 - **TCP transport** - connect-out (TLS 1.2+) and bind/pivot modes
-- **Multi-hop pivoting** - chain multiple Linux TCP bind agents through a single HTTPS parent
+- **Azure Blob Storage** - dead-drop transport via Azure Blob Storage; the agent only connects to `*.blob.core.windows.net:443`, never directly to the C2
+- **GitLab** - dead-drop transport via the GitLab Repository Files API; the agent only connects to `gitlab.com:443` (or a self-hosted instance), never directly to the C2
+- **Multi-hop pivoting** - chain multiple Linux TCP bind agents through any parent transport (HTTPS, TCP Connect, Azure, GitLab)
 - **Multi-architecture** - x86_64 and ARM64
 - **AES-128-CBC encryption** - all frames encrypted end-to-end
 - **SOCKS4/5 proxy** and **reverse port forwarding** via Adaptix tunnel system
@@ -101,6 +103,18 @@ Direct connection to the Adaptix Linux TCP listener. TLS 1.2+ encrypted via Open
 ### TCP Bind (Pivot)
 
 The agent listens on a local port, allowing a parent agent to connect inbound. Supports pivot chains of arbitrary depth. All child traffic is relayed by the parent during its normal beacon cycle.
+
+### Azure Blob Storage
+
+Dead-drop transport. The agent uploads check-ins (`c_*.dat`) and results (`r_*.dat`) to an Azure Blob Storage container and polls for responses from the same container. The C2 listener polls the container independently. The agent never establishes a connection to the C2 — all traffic goes to `*.blob.core.windows.net:443`.
+
+A container-scoped SAS token (90-day validity, `rwdl` permissions) is auto-generated at listener creation and compiled into the agent. The storage account name, container name, and SAS token are embedded using per-byte volatile write macros so they do not appear as strings in the binary.
+
+### GitLab
+
+Dead-drop transport using the GitLab Repository Files API. The agent commits check-in and result files to a branch in a GitLab repository; the C2 listener polls the same repository via the API. The agent never connects to the C2 — all traffic goes to `gitlab.com:443` (or a configured self-hosted instance).
+
+Because GitLab serializes commits per branch, the agent enforces a per-cycle limit on the number of files uploaded to avoid commit conflicts. Conflicts are retried automatically with backoff. The access token, project ID, and URL are embedded using per-byte volatile write macros.
 
 ---
 

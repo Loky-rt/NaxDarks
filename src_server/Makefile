@@ -5,20 +5,22 @@
 NAX_ROOT    := $(shell cd .. && pwd)
 SERVER_DIR  ?= $(NAX_ROOT)/../Server
 
-AGENT_LINUX_DIR          := $(NAX_ROOT)/agent_naxdarks_linux
-LISTENER_LINUX_TCP_DIR   := $(NAX_ROOT)/src_server/listener_naxdarks_linux_tcp
-LISTENER_LINUX_HTTPS_DIR := $(NAX_ROOT)/src_server/listener_naxdarks_linux_https
+AGENT_LINUX_DIR              := $(NAX_ROOT)/agent_naxdarks_linux
+LISTENER_LINUX_TCP_DIR       := $(NAX_ROOT)/src_server/listener_naxdarks_linux_tcp
+LISTENER_LINUX_HTTPS_DIR     := $(NAX_ROOT)/src_server/listener_naxdarks_linux_https
+LISTENER_LINUX_GRAPH_DIR     := $(NAX_ROOT)/src_server/listener_naxdarks_linux_graph
 
-DEPLOY_AGENT_LINUX        := $(SERVER_DIR)/extenders/agent_naxdarks_linux
-DEPLOY_LISTENER_LINUX_TCP   := $(SERVER_DIR)/extenders/listener_naxdarks_linux_tcp
-DEPLOY_LISTENER_LINUX_HTTPS := $(SERVER_DIR)/extenders/listener_naxdarks_linux_https
+DEPLOY_AGENT_LINUX            := $(SERVER_DIR)/extenders/agent_naxdarks_linux
+DEPLOY_LISTENER_LINUX_TCP     := $(SERVER_DIR)/extenders/listener_naxdarks_linux_tcp
+DEPLOY_LISTENER_LINUX_HTTPS   := $(SERVER_DIR)/extenders/listener_naxdarks_linux_https
+DEPLOY_LISTENER_LINUX_GRAPH   := $(SERVER_DIR)/extenders/listener_naxdarks_linux_graph
 
 GO           ?= /usr/local/go/bin/go
 GOEXPERIMENT ?=
 
-.PHONY: all clean agent-linux listener-linux-tcp listener-linux-https
+.PHONY: all clean agent-linux listener-linux-tcp listener-linux-https listener-linux-graph
 
-all: agent-linux listener-linux-tcp listener-linux-https
+all: agent-linux listener-linux-tcp listener-linux-https listener-linux-graph
 
 agent-linux:
 	@echo "  BUILD  agent_naxdarks_linux.so"
@@ -47,8 +49,18 @@ listener-linux-https:
 	@cp $(LISTENER_LINUX_HTTPS_DIR)/config.yaml   $(DEPLOY_LISTENER_LINUX_HTTPS)/config.yaml
 	@echo "  DEPLOY $(DEPLOY_LISTENER_LINUX_HTTPS)/"
 
+listener-linux-graph:
+	@echo "  BUILD  listener_naxdarks_linux_graph.so"
+	@mkdir -p $(DEPLOY_LISTENER_LINUX_GRAPH)
+	@cd $(LISTENER_LINUX_GRAPH_DIR) && GOEXPERIMENT=$(GOEXPERIMENT) $(GO) build -buildmode=plugin \
+		-o $(DEPLOY_LISTENER_LINUX_GRAPH)/listener_naxdarks_linux_graph.so .
+	@cp $(LISTENER_LINUX_GRAPH_DIR)/ax_config.axs $(DEPLOY_LISTENER_LINUX_GRAPH)/ax_config.axs
+	@cp $(LISTENER_LINUX_GRAPH_DIR)/config.yaml   $(DEPLOY_LISTENER_LINUX_GRAPH)/config.yaml
+	@echo "  DEPLOY $(DEPLOY_LISTENER_LINUX_GRAPH)/"
+
 clean:
 	@rm -f $(DEPLOY_AGENT_LINUX)/agent_naxdarks_linux.so
 	@rm -f $(DEPLOY_LISTENER_LINUX_TCP)/listener_naxdarks_linux_tcp.so
 	@rm -f $(DEPLOY_LISTENER_LINUX_HTTPS)/listener_naxdarks_linux_https.so
+	@rm -f $(DEPLOY_LISTENER_LINUX_GRAPH)/listener_naxdarks_linux_graph.so
 	@echo "  CLEAN  done"

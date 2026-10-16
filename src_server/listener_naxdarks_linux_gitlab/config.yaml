@@ -1,0 +1,7 @@
+extender_type: "listener"
+extender_file: "listener_naxdarks_linux_gitlab.so"
+ax_file: "ax_config.axs"
+
+listener_name: "NaxDarksGitLab"
+listener_type: "external"
+protocol: "gitlab"

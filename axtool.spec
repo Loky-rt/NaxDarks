@@ -29,6 +29,36 @@ extenders:
         - "ax_config.axs"
         - "config.yaml"
 
+  - name: listener_naxdarks_linux_graph
+    version: 0.1.0
+    type: listener
+    description: "NaxDarks Graph/Azure dead-drop listener"
+    author: DarksBlack
+    min_server_version: "v2.0"
+    source: src_server/listener_naxdarks_linux_graph
+    build:
+      - go build -buildmode=plugin -o listener_naxdarks_linux_graph.so .
+    release:
+      globs:
+        - "*.so"
+        - "ax_config.axs"
+        - "config.yaml"
+
+  - name: listener_naxdarks_linux_gitlab
+    version: 0.1.0
+    type: listener
+    description: "NaxDarks GitLab Repository Files dead-drop listener"
+    author: DarksBlack
+    min_server_version: "v2.0"
+    source: src_server/listener_naxdarks_linux_gitlab
+    build:
+      - go build -buildmode=plugin -o listener_naxdarks_linux_gitlab.so .
+    release:
+      globs:
+        - "*.so"
+        - "ax_config.axs"
+        - "config.yaml"
+
   - name: agent_naxdarks_linux
     version: 0.1.0
     type: agent

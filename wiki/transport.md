@@ -11,6 +11,8 @@ NaxDarks supports three transport modes, selected at compile time. Each mode pro
 | **HTTPS** | `NAX_TCP_MODE=https` | `_https` | Agent → C2 | Primary transport with malleable profiles |
 | **TCP Connect-out** | `NAX_TCP_MODE=connect` | _(none)_ | Agent → C2 | Direct TCP with TLS, configurable sleep |
 | **TCP Bind** | `NAX_TCP_MODE=bind` | `_bind` | Parent → Agent | Pivoting through chained agents |
+| **Graph (Azure Blob)** | `NAX_TCP_MODE=graph` | `_graph` | Agent → Azure Blob → C2 | Dead-drop via Azure Blob Storage, no direct C2 connection |
+| **GitLab** | `NAX_TCP_MODE=gitlab` | `_gitlab` | Agent → GitLab Repo → C2 | Dead-drop via GitLab Repository Files API, no direct C2 connection |
 
 ```
                     ┌──────────┐
@@ -29,6 +31,16 @@ Internet ───HTTPS──▶│  Agent A │ (HTTPS parent)
                     │  Agent C │ (TCP bind pivot)
                     │  :5555   │
                     └──────────┘
+
+                    ┌──────────┐     Azure Blob     ┌──────────┐
+Internet            │  Agent D │──── c_*.dat ──────▶│ Listener │
+(no direct          │  (Graph) │◀─── r_*.dat ────────│  Graph   │
+ C2 reach)          └──────────┘  blob.core.windows  └──────────┘
+
+                    ┌──────────┐     GitLab Repo     ┌──────────┐
+Internet            │  Agent E │──── c_*.dat ───────▶│ Listener │
+(no direct          │  (GitLab)│◀─── r_*.dat ─────────│  GitLab  │
+ C2 reach)          └──────────┘   gitlab.com/API    └──────────┘
 ```
 
 ---
@@ -187,6 +199,351 @@ Parent Agent                             Bind Agent
 
 ---
 
+## Graph Transport (Azure Blob Storage)
+
+A dead-drop transport. The agent never connects to the C2 server directly — all communication passes through an Azure Blob Storage container. Traffic blends with legitimate Azure traffic on `*.blob.core.windows.net:443`.
+
+### Azure Transport Operation
+
+The transport listener has the following fields:
+
+* Storage Account: The name of the Storage Account.
+* Storage Key: A Base64-encoded string that can be found under Storage browser > Security + networking > Access keys > Key 1 (Key).
+* Container Name: This is arbitrary. A container with the specified name will be created to store the blobs.
+* Poll Interval (s): The listener's response interval.
+* Encryption Key: This can be left blank; it will be generated automatically.
+* Beacon Poll Attempts: The number of attempts the agent makes to locate the listener's response before moving on to the next cycle.
+* Beacon Poll Interval (ms): The amount of time, in milliseconds, that the agent waits between attempts to retrieve the listener's response from Azure.
+
+### Rules:
+
+* The Listener must always respond faster than the Agent. Therefore, the time configured as Poll Interval (s) + Azure latency must be lower than Beacon Poll Interval (ms).
+* Configure at least one additional retry (+1) as a safety margin in case Azure experiences higher-than-usual latency.
+
+### Example of configuration and behavior:
+
+* Poll Interval (s): 5
+* Beacon Poll Attempts: 2
+* Beacon Poll Interval (ms): 15000
+
+In this configuration, the Listener responds within a maximum of 5 seconds. On the other hand, the Agent is configured to communicate every 15 seconds.
+
+Now, what happens if, for some reason, the Agent does not receive a response from the Listener?
+
+With `Beacon Poll Attempts: 2`, the Agent is guaranteed to make a second attempt within the next **15 seconds** to retrieve the Listener's response. In other words, the Agent waits up to approximately **30 seconds** for a response before moving on to the next cycle.
+
+#### Take the Agent's sleep interval into account:
+
+The sleep interval configured in the Agent affects the actual duration of the complete communication cycle. Below are two example scenarios:
+
+1. **Scenario 1:** Sleep configured to **10 seconds**, `Beacon Poll Attempts: 2`, and `Beacon Poll Interval (ms): 15000`.
+
+```text
+10seg           sleep agente
+~1seg           Blob_upload (c_*.dat)
+~15seg          Sleep inside `graph_poll_response`
+~1seg           Blob_download (r_*.dat)
+~1seg           Overhead
+-----------------------------------------------------
+~28 seconds per cycle if the Agent finds `r_*.dat` on the first attempt.
+~43s maximum per cycle if the Agent does not find `r_*.dat` on the first attempt
+```
+
+2. **Scenario 2:** Sleep configured to **0 seconds**, `Beacon Poll Attempts: 2`, and `Beacon Poll Interval (ms): 15000`.
+
+In this case, the approximate time per cycle is:
+
+```text
+0s              Agent sleep
+~1s             Blob_upload (c_*.dat)
+~15s            Sleep inside graph_poll_response
+~1s             Blob_download (r_*.dat)
+~1s             Overhead
+-----------------------------------------------------
+~18s per cycle if the Agent finds r_*.dat on the first attempt
+~33s maximum per cycle if the Agent does not find r_*.dat on the first attempt
+```
+
+**General formula for the maximum time:**
+
+`Maximum Time = Beacon Sleep + (Beacon Poll Interval × Beacon Poll Attempts) + Latency (Azure/Network)`
+
+### Connection flow
+
+```
+Agent                          Azure Blob Container            C2 Listener
+  │                                    │                           │
+  ├── PUT c_<nonce>.dat ──────────────▶│                           │
+  │   [agentCrc(4)][agentUID(16)]      │                           │
+  │   [encLen(4)][b64(AES(frame))]     │                           │
+  │                                    │◀── GET c_<nonce>.dat ─────│  poll
+  │                                    │─── 200 OK ───────────────▶│
+  │                                    │                           │  decrypt, process
+  │                                    │◀── PUT r_<nonce>.dat ─────│  response
+  │◀── GET r_<nonce>.dat ─────────────│                           │
+  │    AES(NO_TASKS or TASK frame)     │                           │
+  │                                    │                           │
+  ├── sleep(configured_ms ± jitter) ───│                           │
+  │                                    │                           │
+  ├── PUT c_<nonce>.dat ──────────────▶│                           │  HEARTBEAT
+  │   ...                              │                           │
+  │                                    │                           │
+  │   (on task result)                 │                           │
+  ├── PUT r_<nonce>.dat ──────────────▶│                           │  RESULT
+  │   [agentCrc(4)][agentUID(16)]      │◀── GET r_<nonce>.dat ─────│
+  │   [encLen(4)][b64(AES(result))]    │─── 200 OK ───────────────▶│  process result
+  └──────────────────────────── loop ──┘                           │
+```
+
+### File format
+
+Every file uploaded by the agent uses the same format:
+
+```
+[agentCrc(4 BE)][agentUID(16)][encLen(4 BE)][base64(AES-CBC(frame))][bodyData]
+```
+
+| Field | Size | Description |
+|-------|------|-------------|
+| `agentCrc` | 4 bytes BE | Listener watermark in clear — allows the listener to filter its own files |
+| `agentUID` | 16 bytes | Raw session UID — allows the listener to identify the agent without decrypting |
+| `encLen` | 4 bytes BE | Length of the base64-encoded ciphertext |
+| `base64(AES-CBC(frame))` | variable | The frame encrypted with AES-128-CBC and base64-encoded |
+| `bodyData` | optional | Additional encrypted payload (tunnel data, pivot results) |
+
+### Blob naming
+
+| Prefix | Direction | Description |
+|--------|-----------|-------------|
+| `c_<nonce>.dat` | Agent → Listener | Check-in (REGISTER or HEARTBEAT) |
+| `r_<nonce>.dat` | Listener → Agent | Response (tasks or NO_TASKS) |
+| `r_<nonce>.dat` | Agent → Listener | Command results and pivot relay data |
+
+The nonce is 16 random hex characters, unique per upload.
+
+### Key behaviors
+
+- **No direct C2 connection:** The agent only connects to `<account>.blob.core.windows.net:443`. The C2 listener polls the same container. No ports need to be open toward the C2.
+- **SAS token:** A container-scoped SAS token is generated at listener creation time (90-day validity) and compiled into the agent. The token has `rwdl` permissions.
+- **Poll and retry:** After uploading `c_<nonce>.dat`, the agent polls for `r_<nonce>.dat` up to `NAX_GRAPH_POLL_MAX` times (default: 15) with `NAX_GRAPH_POLL_MS` ms between attempts (default: 3000ms).
+- **Stale cleanup:** When the listener starts, it deletes all existing blobs in the container to avoid processing stale data from previous sessions.
+- **Pivoting:** Fully supported. Pivot child data is uploaded as separate `r_*.dat` files so the server can route each frame individually.
+
+### Build-time configuration
+
+Graph parameters are written to `include/nax_config.h` by the builder (not passed as `-D` flags, because the SAS token contains characters unsafe for shell argument parsing):
+
+| Define | Source |
+|--------|--------|
+| `NAX_GRAPH_ACCOUNT` | Listener `storage_account` |
+| `NAX_GRAPH_CONTAINER` | Listener `container_name` |
+| `NAX_GRAPH_SAS_TOKEN` | Auto-generated at listener creation |
+| `NAX_GRAPH_POLL_MS` | Listener `poll_interval_ms` (default: 3000) |
+| `NAX_GRAPH_POLL_MAX` | Listener `poll_attempts` (default: 15) |
+
+### Files
+
+| File | Role |
+|------|------|
+| `src/Transport/graph.c` | Azure Blob upload/download/delete, heartbeat loop, pivot drain |
+| `src_server/listener_naxdarks_linux_graph/pl_main.go` | Listener lifecycle, `InternalHandler` for pivot registration |
+| `src_server/listener_naxdarks_linux_graph/pl_transport.go` | Blob polling, checkin processing, result routing |
+| `src_server/listener_naxdarks_linux_graph/pl_crypto.go` | AES-128-CBC encrypt/decrypt, SAS generation |
+
+---
+
+## GitLab Transport
+
+A dead-drop transport that uses the GitLab Repository Files API as a communication channel. The agent never connects to the C2 server directly — all communication passes through commits to a GitLab repository. Traffic blends with legitimate GitLab API activity on `gitlab.com:443` (or a self-hosted instance).
+
+Unlike the Azure Blob transport, GitLab uses a Git-backed storage model where every file operation (create, update, delete) is a Git commit on a branch. This introduces a commit serialization constraint: GitLab rejects concurrent commits to the same branch with HTTP 400. The agent handles this with automatic retry and backoff.
+
+### GitLab Transport Operation
+
+The transport listener has the following fields:
+
+* **GitLab URL:** Base URL of the GitLab instance. Defaults to `https://gitlab.com`. Use the full base URL for self-hosted instances (e.g. `https://git.corp.local`).
+* **Access Token:** A Personal Access Token or Project Access Token with `api` scope. The token is compiled into the agent using volatile per-byte write macros so it does not appear as a string in the binary.
+* **Project ID:** The project in `namespace/project` format (e.g. `myorg/c2-repo`) or its numeric ID.
+* **Branch:** The branch to use for file storage. Defaults to `main`.
+* **Repo Path (optional):** Subdirectory inside the repository where files are stored (e.g. `loky`). If left empty, files are placed in the repo root.
+* **Poll Interval (s):** How often the listener polls the repository for new files.
+* **Encrypt Key:** AES-128 encryption key as a 32-character hex string. Can be left blank — generated automatically.
+* **Beacon Poll Attempts:** Number of times the agent retries downloading the listener's response before giving up and starting the next cycle.
+* **Beacon Poll Interval (ms):** Time the agent waits between poll attempts to retrieve the listener's response file (`r_*.dat`).
+
+### Rules
+
+* The listener must respond faster than the agent times out. Therefore: `Poll Interval (s) + GitLab API latency` must be less than `Poll Interval (ms) × Beacon Poll Attempts`.
+* Configure at least one extra poll attempt (+1) as a safety margin for GitLab latency spikes.
+* GitLab serializes commits per branch. Uploading multiple files in rapid succession will trigger HTTP 400 conflict errors. The agent retries automatically with backoff, but this limits throughput. **Do not reduce the per-cycle chunk limit** — it exists specifically to avoid saturating the branch.
+
+### Example configuration and behavior
+
+* Poll Interval (s): 5
+* Beacon Poll Attempts: 2
+* Beacon Poll Interval (ms): 20000
+
+In this configuration the listener responds within 5 seconds. The agent waits up to 40 seconds for a response before moving on.
+
+#### Cycle timing
+
+**With sleep configured to 5 seconds:**
+
+```text
+5s      Agent sleep
+~2s     gitlab_upload (c_*.dat) — includes commit
+~20s    Sleep inside gitlab_poll_response (first attempt)
+~2s     gitlab_download (r_*.dat)
+~1s     Overhead
+-----------------------------------------------------
+~30s per cycle if r_*.dat found on first attempt
+~52s maximum per cycle (second poll attempt exhausted)
+```
+
+**With sleep configured to 0 seconds (interactive):**
+
+```text
+0s      Agent sleep
+~2s     gitlab_upload (c_*.dat)
+~20s    Sleep inside gitlab_poll_response
+~2s     gitlab_download (r_*.dat)
+~1s     Overhead
+-----------------------------------------------------
+~25s per cycle (first attempt)
+~47s maximum per cycle
+```
+
+**General formula:**
+
+`Maximum time = Sleep + (Poll Interval ms × Poll Attempts) + GitLab API latency`
+
+### Connection flow
+
+```
+Agent                        GitLab Repo (branch)           C2 Listener
+  │                                  │                           │
+  ├── POST files/:path (create) ────▶│                           │
+  │   c_<nonce>.dat                  │                           │
+  │   [agentCrc(4)][agentUID(16)]    │                           │
+  │   [encLen(4)][b64(AES(frame))]   │                           │
+  │                                  │◀── list files (tree) ─────│  poll
+  │                                  │─── 200 OK ───────────────▶│  detect c_*.dat
+  │                                  │                           │  decrypt, process
+  │                                  │◀── POST r_<nonce>.dat ────│  response
+  │                                  │   AES(NO_TASKS or TASK)   │
+  │                                  │◀── DELETE c_<nonce>.dat ──│  cleanup
+  │◀── GET files/:path/raw ──────────│                           │
+  │    AES(NO_TASKS or TASK frame)   │                           │
+  │                                  │                           │
+  ├── sleep(configured_ms ± jitter)  │                           │
+  │                                  │                           │
+  ├── POST c_<nonce>.dat ───────────▶│                           │  HEARTBEAT
+  │   ...                            │                           │
+  │                                  │                           │
+  │   (on task result)               │                           │
+  ├── POST r_<nonce>_<seq>.dat ─────▶│                           │  RESULT
+  │   [agentCrc(4)][agentUID(16)]    │◀── list → detect r_*_seq──│
+  │   [encLen(4)][b64(AES(result))]  │─── 200 OK ───────────────▶│  process result
+  │                                  │◀── DELETE r_*_seq.dat ────│  cleanup
+  └───────────────────────── loop ───┘                           │
+```
+
+### File format
+
+Every file uploaded by the agent uses the same format as the Graph transport:
+
+```
+[agentCrc(4 BE)][agentUID(16)][encLen(4 BE)][base64(AES-CBC(frame))][bodyData]
+```
+
+| Field | Size | Description |
+|-------|------|-------------|
+| `agentCrc` | 4 bytes BE | Listener watermark — allows the listener to filter its own files |
+| `agentUID` | 16 bytes | Raw session UID — identifies the agent without decryption |
+| `encLen` | 4 bytes BE | Length of the base64-encoded ciphertext |
+| `base64(AES-CBC(frame))` | variable | Frame encrypted with AES-128-CBC, then base64-encoded for the JSON API |
+| `bodyData` | optional | Additional encrypted payload (tunnel data, pivot results) |
+
+The `content` field in the GitLab API payload uses `"encoding": "base64"`, so the file data is base64-encoded once more for the API body. GitLab decodes and stores the original bytes. The agent and listener download raw content via the `/raw` endpoint, recovering the original bytes.
+
+### File naming
+
+| Pattern | Direction | Description |
+|---------|-----------|-------------|
+| `c_<nonce>.dat` | Agent → Listener | Check-in (REGISTER or HEARTBEAT) |
+| `r_<nonce>.dat` | Listener → Agent | Response (tasks or NO_TASKS) |
+| `r_<nonce>_<seq8d>.dat` | Agent → Listener | Command result or pivot relay data |
+
+The nonce is 16 random hex characters. Result files include an 8-digit zero-padded sequence number (e.g. `_00000003`) so the listener can process them in strict order and detect gaps.
+
+### Throughput and per-cycle limits
+
+Because every file operation is a Git commit, GitLab serializes writes to the same branch. Uploading too many files in a single cycle triggers HTTP 400 conflict errors. The agent enforces the following limits per heartbeat cycle:
+
+| Data type | Limit per cycle | Rationale |
+|-----------|----------------|-----------|
+| Download chunks | 2 | Prevents branch saturation during large file transfers |
+| Pivot messages ≥ 1 KB | 2 | Prevents branch saturation during pivot data relay |
+| Pivot messages < 1 KB | Unlimited | Heartbeats and ACKs are drained without limit so they don't block the chunk queue |
+
+When a commit fails with HTTP 400, the agent retries up to 5 times with linear backoff (1.5 s × attempt number) before giving up on that file.
+
+### Deduplication
+
+The listener maintains a `processedSeqs` in-memory set of result filenames (`r_*_seq.dat`) already delivered to the teamserver. If a delete fails and the file reappears in the next poll cycle, it is skipped rather than processed a second time, preventing duplicate chunks and file corruption.
+
+The set is cleared when the listener stops. Entries are removed from the set only after the file is confirmed deleted from the repository.
+
+### Key behaviors
+
+- **No direct C2 connection:** The agent only connects to `gitlab.com:443` (or the configured self-hosted URL). The C2 listener polls the same repository via the API. No ports need to be open toward the C2.
+- **Repo path isolation:** When `RepoPath` is configured, a `.gitkeep` placeholder is created at startup to ensure the directory exists before the first agent check-in.
+- **Stale cleanup:** When the listener starts, it deletes all existing `.dat` files in the configured path to avoid processing stale data from previous sessions.
+- **Commit conflict retry:** Both agent and listener handle HTTP 400 (commit conflict) gracefully with retry and backoff. The agent retries up to 5 times; the listener's delete retries once and relies on the deduplication set for safety.
+- **Sequence ordering:** The listener sorts `r_*_seq.dat` files by sequence number before processing, ensuring results are delivered in order even if uploads arrive out of order.
+- **Pivoting:** Fully supported. Pivot child data is uploaded as separate `r_*_seq.dat` files so the server can route each frame individually.
+- **Self-hosted GitLab:** Supported by setting `GitLab URL` to the instance base URL.
+
+### Build-time configuration
+
+GitLab parameters are written to `include/nax_config.h` by the builder using volatile per-byte write macros. Sensitive values (token, project ID, URL) never appear as string literals in the binary:
+
+| Define | Source |
+|--------|--------|
+| `NAX_GITLAB_URL_WRITE` / `NAX_GITLAB_URL_LEN` | Listener `gitlab_url` |
+| `NAX_GITLAB_TOKEN_WRITE` / `NAX_GITLAB_TOKEN_LEN` | Listener `access_token` |
+| `NAX_GITLAB_PROJECT_WRITE` / `NAX_GITLAB_PROJECT_LEN` | Listener `project_id` |
+| `NAX_GITLAB_BRANCH_WRITE` / `NAX_GITLAB_BRANCH_LEN` | Listener `branch` (default: `main`) |
+| `NAX_GITLAB_REPO_PATH_WRITE` / `NAX_GITLAB_REPO_PATH_LEN` | Listener `repo_path` (default: empty) |
+| `NAX_GITLAB_POLL_MS` | Listener `poll_interval_ms` (default: 3000) |
+| `NAX_GITLAB_POLL_MAX` | Listener `poll_attempts` (default: 1) |
+
+### Comparison with Azure Blob (Graph) transport
+
+| | Graph (Azure Blob) | GitLab |
+|---|---|---|
+| Storage backend | Azure Blob Storage | GitLab Repository Files API |
+| Traffic destination | `*.blob.core.windows.net:443` | `gitlab.com:443` (or self-hosted) |
+| Write model | Independent blob PUT operations | Git commits (serialized per branch) |
+| Concurrent writes | No conflict | HTTP 400 on conflict — retry required |
+| File content encoding | Binary (raw bytes) | base64 inside JSON API body |
+| Result file naming | `r_<nonce>_<seq>.dat` | `r_<nonce>_<seq8d>.dat` |
+| Throughput | Higher (parallel blobs) | Lower (serialized commits) |
+| Infrastructure required | Azure Storage account | GitLab account + repository |
+| SAS / token expiry | 90-day SAS auto-generated | Token set by user, no auto-expiry |
+
+### Files
+
+| File | Role |
+|------|------|
+| `src/Transport/gitlab.c` | GitLab API upload/download/delete, heartbeat loop, pivot drain |
+| `src_server/listener_naxdarks_linux_gitlab/pl_main.go` | Listener lifecycle, `InternalHandler` for pivot registration |
+| `src_server/listener_naxdarks_linux_gitlab/pl_transport.go` | Repository polling, checkin processing, result routing, deduplication |
+| `src_server/listener_naxdarks_linux_gitlab/pl_crypto.go` | AES-128-CBC encrypt/decrypt |
+
+---
+
 ## Pivoting
 
 Multi-hop pivoting allows chaining agents through internal networks:
@@ -324,6 +681,10 @@ Tunnel I/O is non-blocking and single-threaded — no additional threads are cre
 | `src/Transport/https_profile.c` | Malleable profile encoder/decoder |
 | `src/Transport/tcp.c` | TCP connect-out transport |
 | `src/Transport/tcp_bind.c` | TCP bind (pivot) transport |
+| `src/Transport/graph.c` | Azure Blob Storage dead-drop transport |
 | `src/Commands/tunnel.c` | Non-blocking tunnel I/O |
 | `src/Core/packer.c` | Frame encode/decode, AES encrypt/decrypt |
 | `include/nax_linux.h` | Wire constants, frame header size |
+| `src_server/listener_naxdarks_linux_graph/` | Graph listener (Go plugin) |
+| `src/Transport/gitlab.c` | GitLab Repository Files dead-drop transport |
+| `src_server/listener_naxdarks_linux_gitlab/` | GitLab listener (Go plugin) |

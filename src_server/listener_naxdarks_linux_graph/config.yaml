@@ -1,0 +1,7 @@
+extender_type: "listener"
+extender_file: "listener_naxdarks_linux_graph.so"
+ax_file: "ax_config.axs"
+
+listener_name: "NaxDarksGraph"
+listener_type: "external"
+protocol: "graph"

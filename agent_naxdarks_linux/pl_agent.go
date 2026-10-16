@@ -114,7 +114,8 @@ func (p *PluginAgent) CreateAgent(beat []byte) (adaptix.AgentData, adaptix.Agent
 			errors.New("linux agent: CreateAgent: beat too short")
 	}
 
-	beaconID := string(beat[:16])
+	beaconID    := string(beat[:16])
+	beaconIDHex := fmt.Sprintf("%x", beat[:16])
 	aesKey   := make([]byte, 16)
 	copy(aesKey, beat[16:32])
 	frameData := beat[32:]
@@ -127,15 +128,25 @@ func (p *PluginAgent) CreateAgent(beat []byte) (adaptix.AgentData, adaptix.Agent
 	}
 
 	naxLogInfo("CreateAgent (linux): beaconID=%s keyPrefix=%x frameDataLen=%d",
-		beaconID, aesKey[:4], len(frameData))
+		beaconIDHex, aesKey[:4], len(frameData))
 
 	decrypted, err := DecryptCBC(aesKey, frameData)
 	if err != nil {
-		naxLogErr("CreateAgent (linux): decrypt failed beaconID=%s: %v", beaconID, err)
+		naxLogErr("CreateAgent (linux): decrypt failed beaconID=%s: %v", beaconIDHex, err)
 		return ad, p.AgentRestore(ad), nil
 	}
 
-	msgType, _, body, err := DecodeFrame(decrypted)
+	// Graph transport prefixes the plaintext with [agentCrc(4)][agentUID(16)]
+	// before the frame. Try decoding from byte 0 first; if it fails and there
+	// are at least 20 bytes, retry from byte 20.
+	frameStart := decrypted
+	msgType, _, body, err := DecodeFrame(frameStart)
+	if err != nil && len(decrypted) >= 20 {
+		if _, _, _, err2 := DecodeFrame(decrypted[20:]); err2 == nil {
+			frameStart = decrypted[20:]
+			msgType, _, body, err = DecodeFrame(frameStart)
+		}
+	}
 	if err != nil {
 		naxLogErr("CreateAgent (linux): DecodeFrame failed: %v", err)
 		return ad, p.AgentRestore(ad), nil
@@ -182,7 +193,7 @@ func (p *PluginAgent) CreateAgent(beat []byte) (adaptix.AgentData, adaptix.Agent
 	ad.OsDesc     = linuxOsDesc(reg.OsMajor, reg.OsMinor, reg.OsBuild, arch)
 
 	naxLogOk("CreateAgent (linux): beaconID=%s host=%s user=%s pid=%s arch=%s ip=%s elevated=%v os=%s",
-		beaconID, ad.Computer, ad.Username, ad.Pid, ad.Arch, ad.InternalIP, ad.Elevated, ad.OsDesc)
+		beaconIDHex, ad.Computer, ad.Username, ad.Pid, ad.Arch, ad.InternalIP, ad.Elevated, ad.OsDesc)
 
 	agentIdentityCache.Store(beaconID, ad)
 	saveCacheEntry(beaconID, ad)

