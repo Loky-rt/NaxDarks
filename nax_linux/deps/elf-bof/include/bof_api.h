@@ -69,6 +69,8 @@ void   BeaconFormatInt(formatp *format, int value);
 int    BeaconIsAdmin(void);
 int    BeaconGetStopJobEvent(void);
 
+#ifndef NAX_BOF_STANDALONE
+
 /* File system */
 
 int     AxFstatvfs(int fd, struct statvfs *buf);
@@ -212,11 +214,14 @@ int     AxIoUringRegister(int fd, unsigned int opcode, void *arg,
 /* Time */
 struct tm *AxLocaltime(const time_t *timer);
 
-/* ── Inter-BOF shared globals (persist across BOF executions) ── */
+#endif /* NAX_BOF_STANDALONE */
 
+/* ── Inter-BOF shared globals (persist across BOF executions) ─────────────
+ * SDK-internal mechanism — always present regardless of build mode.
+ * key MUST have static or permanent lifetime (e.g. a string literal).
+ * The pointer is stored directly — no copy is made.
+ */
 void  *AxGetGlobal(const char *key);
-/* key MUST have static or permanent lifetime (e.g. a string literal).
- * The pointer is stored directly — no copy is made. */
 void   AxSetGlobal(const char *key, void *ptr);
 
 #endif /* LINUX_BEACON_API_H */
