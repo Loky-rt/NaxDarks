@@ -19,7 +19,7 @@ function GenerateUI(listeners_type)
     comboArch.addItems(["x64", "arm64"]);
 
     let comboFormat = form.create_combo();
-    comboFormat.addItems(["elf", "so"]);
+    comboFormat.addItems(["elf", "so", "exe"]);
     tab1.addWidget(form.create_label("Architecture:"), t1r, 0);
     tab1.addWidget(comboArch, t1r, 1); t1r++;
 

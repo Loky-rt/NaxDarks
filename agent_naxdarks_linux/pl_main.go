@@ -430,6 +430,8 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 
 	if outFormat == "so" {
 		makeArgs = append(makeArgs, "NAX_FORMAT=so")
+	} else if outFormat == "exe" {
+		makeArgs = append(makeArgs, "NAX_FORMAT=exe")
 	}
 	if opsec {
 		makeArgs = append(makeArgs, "NAX_OPSEC=1")
@@ -547,14 +549,16 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 	debugSuffix := ""
 	if naxDebug == "1" { debugSuffix = "_debug" }
 	soSuffix := ""
-	if outFormat == "so" { soSuffix = ".so" }
-	binPath := filepath.Join(srcDir, "_bin", "nax_linux"+suffix+debugSuffix+soSuffix)
+	exeSuffix := ""
+	if outFormat == "so"  { soSuffix  = ".so"  }
+	if outFormat == "exe" { exeSuffix = "_exe"  }
+	binPath := filepath.Join(srcDir, "_bin", "nax_linux"+suffix+debugSuffix+exeSuffix+soSuffix)
 	data, err := os.ReadFile(binPath)
 	if err != nil {
 		return nil, "", fmt.Errorf("linux agent: binary not found after build: %w", err)
 	}
 
-	filename := fmt.Sprintf("nax_linux_%s%s%s%s", arch, suffix, debugSuffix, soSuffix)
+	filename := fmt.Sprintf("nax_linux_%s%s%s%s%s", arch, suffix, debugSuffix, exeSuffix, soSuffix)
 	naxLogOk("BuildPayload: compiled %s (%d bytes)", filename, len(data))
 
 	// The stub already embeds the agent and selects the loader technique
