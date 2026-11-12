@@ -44,6 +44,7 @@ int agent_run(void)
 {
 
     srand((unsigned int)time(NULL));
+#ifndef NAX_FORMAT_EXE
     {
         char _comm[32] = {0};
 #ifdef NAX_COMM_NAME_WRITE
@@ -56,6 +57,7 @@ int agent_run(void)
 #endif
         prctl(PR_SET_NAME, _comm, 0, 0, 0);
     }
+#endif
     signal(SIGPIPE, SIG_IGN);
 
 //    prctl(PR_SET_DUMPABLE, 0);

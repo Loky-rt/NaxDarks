@@ -89,6 +89,7 @@ int nax_build_reg_body(const char *, uint32_t, const char *, uint32_t,
                        uint32_t, uint32_t, uint16_t,
                        uint32_t, uint32_t, uint32_t,
                        const char *, uint32_t,
+                       uint8_t,
                        uint8_t *, uint32_t *);
 int nax_build_heartbeat(uint8_t *, uint32_t *);
 extern int nax_build_no_tasks(uint8_t *, uint32_t *);
@@ -278,6 +279,7 @@ static int do_register(NaxAgent *a)
             0,
             0,
             info.imgpath, strlen(info.imgpath),
+            (uint8_t)a->cfg.jitter_pct,
             reg_body, &reg_body_len) < 0)
         return -1;
 

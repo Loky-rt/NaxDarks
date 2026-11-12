@@ -54,16 +54,14 @@ function GenerateUI(listeners_type)
 
     let spinSleep  = form.create_spin();
     let spinJitter = form.create_spin();
-    if (isHttps || isGraph || isGitLab) {
-        spinSleep.setRange(0, 3600);
-        spinSleep.setValue(5);
-        spinJitter.setRange(0, 100);
-        spinJitter.setValue(0);
-        tab1.addWidget(form.create_label("Sleep (s):"),  t1r, 0);
-        tab1.addWidget(spinSleep,  t1r, 1); t1r++;
-        tab1.addWidget(form.create_label("Jitter (%):"), t1r, 0);
-        tab1.addWidget(spinJitter, t1r, 1); t1r++;
-    }
+    spinSleep.setRange(0, 3600);
+    spinSleep.setValue(5);
+    spinJitter.setRange(0, 100);
+    spinJitter.setValue(0);
+    tab1.addWidget(form.create_label("Sleep (s):"),  t1r, 0);
+    tab1.addWidget(spinSleep,  t1r, 1); t1r++;
+    tab1.addWidget(form.create_label("Jitter (%):"), t1r, 0);
+    tab1.addWidget(spinJitter, t1r, 1); t1r++;
 
     let labelLoader = form.create_label("Loader technique:");
     let comboLoader = form.create_combo();
@@ -217,9 +215,10 @@ function RegisterCommands(listenerType)
     cmd_rportfwd.addSubCommands([cmd_rportfwd_start, cmd_rportfwd_stop]);
 
     // ---- link (pivot) ----
-    let cmd_link_tcp = ax.create_command("tcp-bind", "Connect to a child Linux beacon listening on a TCP port", "link tcp-bind {target} {port}", "Queuing link tcp-bind...");
-    cmd_link_tcp.addArgString("target", true, "Target IP or hostname where the bind agent is listening");
-    cmd_link_tcp.addArgInt("port",      true, "TCP port the bind agent is listening on");
+    let cmd_link_tcp = ax.create_command("tcp-bind", "Connect to a child beacon listening on a TCP port", "link tcp-bind 192.168.100.129 4444 | link tcp-bind 192.168.100.129 4444 raw", "Queuing link tcp-bind...");
+    cmd_link_tcp.addArgString("target", true,  "Target IP or hostname where the bind agent is listening");
+    cmd_link_tcp.addArgInt("port",      true,  "TCP port the bind agent is listening on");
+    cmd_link_tcp.addArgString("mode",   false, "Transport mode: raw/tls (default: tls for NaxDarks Linux)");
 
     let cmd_link = ax.create_command("link", "Link to a child Linux pivot beacon via TCP");
     cmd_link.addSubCommands([cmd_link_tcp]);

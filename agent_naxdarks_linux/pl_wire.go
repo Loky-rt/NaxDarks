@@ -63,6 +63,7 @@ type RegisterBody struct {
 	Acp       uint32
 	OemCp     uint32
 	ImgPath   string
+	JitterPct byte
 }
 
 func DecodeRegister(body []byte) (RegisterBody, error) {
@@ -146,6 +147,11 @@ func DecodeRegister(body []byte) (RegisterBody, error) {
 			r.ImgPath = img
 			cursor = newCursor
 		}
+	}
+	// jitter_pct appended at end — optional for backward compat
+	if cursor+1 <= len(body) {
+		r.JitterPct = body[cursor]
+		cursor++
 	}
 	_ = cursor
 	return r, nil

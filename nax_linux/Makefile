@@ -210,6 +210,7 @@ else ifeq ($(NAX_FORMAT),exe)
   # strings(1) reveals nothing.  A constructor in exe.c decrypts it
   # before agent_run() starts.
   SRCS   += src/exe.c
+  CFLAGS += -DNAX_FORMAT_EXE
   RODATA_ENCRYPT := 1
   SUFFIX := $(SUFFIX)_exe
 else

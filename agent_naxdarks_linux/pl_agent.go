@@ -15,6 +15,7 @@ type cachedAgentIdentity struct {
 	Tid        string
 	Arch       string
 	Sleep      uint
+	Jitter     uint
 	InternalIP string
 	Domain     string
 	Process    string
@@ -42,7 +43,7 @@ func loadCacheFromStore() {
 		}
 		ad := adaptix.AgentData{
 			Computer: e.Computer, Username: e.Username, Pid: e.Pid,
-			Tid: e.Tid, Arch: e.Arch, Sleep: e.Sleep,
+			Tid: e.Tid, Arch: e.Arch, Sleep: e.Sleep, Jitter: e.Jitter,
 			InternalIP: e.InternalIP, Domain: e.Domain,
 			Process: e.Process, Elevated: e.Elevated,
 			OsDesc: e.OsDesc,
@@ -59,7 +60,7 @@ func saveCacheEntry(beaconID string, ad adaptix.AgentData) {
 	}
 	e := cachedAgentIdentity{
 		Computer: ad.Computer, Username: ad.Username, Pid: ad.Pid,
-		Tid: ad.Tid, Arch: ad.Arch, Sleep: ad.Sleep,
+		Tid: ad.Tid, Arch: ad.Arch, Sleep: ad.Sleep, Jitter: ad.Jitter,
 		InternalIP: ad.InternalIP, Domain: ad.Domain,
 		Process: ad.Process, Elevated: ad.Elevated,
 		OsDesc: ad.OsDesc,
@@ -163,6 +164,7 @@ func (p *PluginAgent) CreateAgent(beat []byte) (adaptix.AgentData, adaptix.Agent
 			ad.Tid        = cachedAd.Tid
 			ad.Arch       = cachedAd.Arch
 			ad.Sleep      = cachedAd.Sleep
+			ad.Jitter     = cachedAd.Jitter
 			ad.InternalIP = cachedAd.InternalIP
 			ad.Domain     = cachedAd.Domain
 			ad.Process    = cachedAd.Process
@@ -186,6 +188,7 @@ func (p *PluginAgent) CreateAgent(beat []byte) (adaptix.AgentData, adaptix.Agent
 	ad.Tid        = fmt.Sprintf("%d", reg.Tid)
 	ad.Arch       = arch
 	ad.Sleep      = uint(reg.SleepMs / 1000)
+	ad.Jitter     = uint(reg.JitterPct)
 	ad.InternalIP = reg.Ip
 	ad.Domain     = reg.Domain
 	ad.Process    = reg.ProcessName

