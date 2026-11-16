@@ -35,12 +35,16 @@ NAX_STUB        ?= 1
 # Loader technique: 0=auto 1=tmpfile 2=keyring 3=memfd
 NAX_LOADER_METHOD ?= 0
 
-RODATA_CRYPT    := src/stub/rodata_crypt.py
 comma           := ,
 STUB_DIR        := src/stub
 STUB_SRC        := $(STUB_DIR)/stub.c
 STUB_PAYLOAD    := $(STUB_DIR)/stub_payload.h
-STUB_GEN        := $(STUB_DIR)/gen_stub_payload.py
+
+# C tools (replace Python scripts — no Python dependency)
+RODATA_CRYPT    := $(STUB_DIR)/rodata_crypt
+STUB_GEN        := $(STUB_DIR)/gen_stub_payload
+RODATA_CRYPT_SRC := $(STUB_DIR)/rodata_crypt.c
+STUB_GEN_SRC    := $(STUB_DIR)/gen_stub_payload.c
 
 BOF_SDK_DIR := deps/elf-bof
 BOF_SDK_INC := $(BOF_SDK_DIR)/include
@@ -220,15 +224,25 @@ endif
 
 TARGET  := $(OUTDIR)/nax_linux$(SUFFIX)
 
-.PHONY: all clean _build
+.PHONY: all clean _build tools
 
-all: clean
+all:
+	@$(MAKE) --no-print-directory clean
 	@$(MAKE) --no-print-directory _build
 
+# Build the C post-build tools (once, natively — always with the host gcc)
+tools: $(RODATA_CRYPT) $(STUB_GEN)
+
+$(RODATA_CRYPT): $(RODATA_CRYPT_SRC)
+	gcc -O2 -o $@ $<
+
+$(STUB_GEN): $(STUB_GEN_SRC)
+	gcc -O2 -o $@ $<
+
 ifeq ($(NAX_STUB),1)
-_build: $(OUTDIR) $(OUTDIR)/.stub_built
+_build: tools $(OUTDIR) $(OUTDIR)/.stub_built
 else
-_build: $(OUTDIR) $(TARGET)
+_build: tools $(OUTDIR) $(TARGET)
 	@echo "[+] Built: $(TARGET)"
 endif
 
@@ -237,7 +251,7 @@ $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) $(SRCS) -o $(TARGET) $(BOF_SDK_LIB) $(LDFLAGS) $(LDFLAGS_EXTRA)
 ifeq ($(RODATA_ENCRYPT),1)
 	@echo "[+] Encrypting .rodata in $(TARGET)"
-	python3 $(RODATA_CRYPT) $(TARGET)
+	$(RODATA_CRYPT) $(TARGET)
 endif
 ifeq ($(NAX_FORMAT),so)
 	@objcopy --remove-section=.comment \
@@ -258,7 +272,7 @@ ifeq ($(NAX_STUB),1)
 
 $(STUB_PAYLOAD): $(TARGET) $(STUB_GEN)
 	@echo "[+] Generating stub payload from $(TARGET)"
-	@cd $(STUB_DIR) && python3 gen_stub_payload.py ../../$(TARGET) >/dev/null
+	$(STUB_GEN) $(TARGET) $(STUB_DIR)
 
 $(OUTDIR)/.stub_built: $(TARGET) $(STUB_PAYLOAD) $(STUB_SRC)
 	@echo "[+] Wrapping $(TARGET) with stub (loader=NAX_LOADER_METHOD=$(NAX_LOADER_METHOD))"
@@ -274,3 +288,6 @@ endif
 clean:
 	rm -rf $(OUTDIR)
 	rm -f $(STUB_PAYLOAD)
+
+clean-tools:
+	rm -f $(RODATA_CRYPT) $(STUB_GEN)

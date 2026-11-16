@@ -1199,6 +1199,9 @@ static uint8_t cmd_profile_update(NaxAgent *a, NaxTask *t, uint8_t **out, uint32
 
 /* ===== BOF async ===== */
 
+#define NAX_MAX_ASYNC_JOBS 8
+static uint32_t g_job_task_ids[NAX_MAX_ASYNC_JOBS] = {0};
+
 static uint8_t cmd_bof_async(NaxAgent *a, NaxTask *t, uint8_t **out, uint32_t *out_len)
 {
     (void)a;
@@ -1234,6 +1237,9 @@ static uint8_t cmd_bof_async(NaxAgent *a, NaxTask *t, uint8_t **out, uint32_t *o
         return NAX_STATUS_ERR;
     }
 
+    if (idx >= 0 && idx < NAX_MAX_ASYNC_JOBS)
+        g_job_task_ids[idx] = t->task_id;
+
     /* Don't send result now — async_drain will send it when the BOF completes */
     *out = NULL;
     *out_len = 0;
@@ -1265,8 +1271,25 @@ static uint8_t cmd_bof_kill(NaxAgent *a, NaxTask *t, uint8_t **out, uint32_t *ou
     }
     int idx = (int)(t->args[0] | (t->args[1]<<8) | (t->args[2]<<16) | (t->args[3]<<24));
     if (nax_async_kill(idx) == 0) {
-        char msg[64]; snprintf(msg, sizeof(msg), "Job #%d stop signal sent", idx);
-        *out = (uint8_t *)strdup(msg); *out_len = (uint32_t)strlen((char *)*out);
+        uint32_t killed_task_id = 0;
+        if (idx >= 0 && idx < NAX_MAX_ASYNC_JOBS) {
+            killed_task_id      = g_job_task_ids[idx];
+            g_job_task_ids[idx] = 0;
+        }
+        char msg[64]; snprintf(msg, sizeof(msg), "Async job #%d killed", idx);
+        uint32_t msglen = (uint32_t)strlen(msg);
+        /* Response layout: [task_id(4 LE)][text message] */
+        uint8_t *resp = (uint8_t *)malloc(4 + msglen);
+        if (!resp) {
+            *out = (uint8_t *)strdup(msg); *out_len = msglen;
+            return NAX_STATUS_OK;
+        }
+        resp[0] = (uint8_t)(killed_task_id);
+        resp[1] = (uint8_t)(killed_task_id >> 8);
+        resp[2] = (uint8_t)(killed_task_id >> 16);
+        resp[3] = (uint8_t)(killed_task_id >> 24);
+        memcpy(resp + 4, msg, msglen);
+        *out = resp; *out_len = 4 + msglen;
         return NAX_STATUS_OK;
     } else {
         *out = (uint8_t *)strdup("jobkill: invalid job index or not running");

@@ -1,0 +1,205 @@
+/*
+ * gen_stub_payload.c — Encrypt agent binary and generate stub_payload.h
+ *                      (replaces gen_stub_payload.py)
+ */
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <libgen.h>
+
+#define KEY_LEN  32
+#define SALT_LEN 16
+#define PASS_LEN 32
+
+static const int FRAG_ORDER[4] = {2, 0, 3, 1};
+
+static void die(const char *msg)
+{
+    fprintf(stderr, "[-] %s\n", msg);
+    exit(1);
+}
+
+static void die_errno(const char *msg)
+{
+    fprintf(stderr, "[-] %s: %s\n", msg, strerror(errno));
+    exit(1);
+}
+
+static void random_bytes(uint8_t *buf, size_t n)
+{
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) die_errno("/dev/urandom");
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = read(fd, buf + got, n - got);
+        if (r <= 0) die_errno("read /dev/urandom");
+        got += (size_t)r;
+    }
+    close(fd);
+}
+
+static uint8_t *read_file(const char *path, size_t *size)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) die_errno(path);
+
+    struct stat st;
+    if (fstat(fileno(f), &st) != 0) die_errno("fstat");
+    *size = (size_t)st.st_size;
+    if (*size == 0) die("agent binary is empty");
+
+    uint8_t *buf = malloc(*size);
+    if (!buf) die("out of memory");
+    if (fread(buf, 1, *size, f) != *size) die("short read");
+    fclose(f);
+    return buf;
+}
+
+/* KDF: FNV-1a 64-bit seed + xorshift64 expansion */
+
+static void fnv1a_xorshift_kdf(uint8_t *key, size_t key_len,
+                                 const uint8_t *pass, size_t pass_len,
+                                 const uint8_t *salt, size_t salt_len)
+{
+    uint64_t state = 0xCBF29CE484222325ULL;
+
+    for (size_t i = 0; i < pass_len; i++) {
+        state ^= pass[i];
+        state *= 0x100000001B3ULL;
+    }
+    for (size_t i = 0; i < salt_len; i++) {
+        state ^= salt[i];
+        state *= 0x100000001B3ULL;
+    }
+    for (size_t i = 0; i < key_len; i++) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        key[i] = (uint8_t)(state & 0xFF);
+    }
+}
+
+/* passphrase obfuscation + fragmentation */
+
+static void obfuscate_and_fragment(const uint8_t *pass,
+                                    uint8_t frags[4][8])
+{
+    uint8_t obf[PASS_LEN];
+    for (int i = 0; i < PASS_LEN; i++)
+        obf[i] = pass[i] ^ ((uint8_t)(0x37 + i * 13));
+
+    /* chunks[k] = obf[k*8 .. k*8+7] */
+    /* store: frag slot i ← chunk[ FRAG_ORDER[i] ] */
+    for (int i = 0; i < 4; i++)
+        memcpy(frags[i], obf + FRAG_ORDER[i] * 8, 8);
+}
+
+/* C array formatters */
+
+static void write_byte_array(FILE *out, const char *name,
+                              size_t len, const uint8_t *data)
+{
+    fprintf(out, "static const unsigned char %s[%zu] = {", name, len);
+    for (size_t i = 0; i < len; i++) {
+        if (i % 16 == 0) fprintf(out, "\n    ");
+        fprintf(out, "0x%02X", data[i]);
+        if (i + 1 < len) fprintf(out, ",");
+    }
+    fprintf(out, "\n};\n\n");
+}
+
+static void write_payload(FILE *out, const uint8_t *data, size_t len)
+{
+    fprintf(out, "static unsigned char stub_payload[] = {");
+    for (size_t i = 0; i < len; i++) {
+        if (i % 16 == 0) fprintf(out, "\n    ");
+        fprintf(out, "0x%02x", data[i]);
+        if (i + 1 < len) fprintf(out, ",");
+    }
+    fprintf(out, "\n};\n");
+    fprintf(out, "static unsigned int stub_payload_len = %zu;\n", len);
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <agent_binary> [output_dir]\n", argv[0]);
+        return 1;
+    }
+
+    const char *agent_path = argv[1];
+
+    char out_dir[4096];
+    if (argc >= 3) {
+        snprintf(out_dir, sizeof(out_dir), "%s", argv[2]);
+    } else {
+
+        char tmp[4096];
+        snprintf(tmp, sizeof(tmp), "%s", agent_path);
+        snprintf(out_dir, sizeof(out_dir), "%s", dirname(tmp));
+    }
+
+    char out_path[4096];
+    snprintf(out_path, sizeof(out_path), "%s/stub_payload.h", out_dir);
+
+    size_t agent_size;
+    uint8_t *agent_data = read_file(agent_path, &agent_size);
+
+    uint8_t passphrase[PASS_LEN];
+    uint8_t salt[SALT_LEN];
+    random_bytes(passphrase, PASS_LEN);
+    random_bytes(salt, SALT_LEN);
+
+    uint8_t key[KEY_LEN];
+    fnv1a_xorshift_kdf(key, KEY_LEN, passphrase, PASS_LEN, salt, SALT_LEN);
+
+    uint8_t *encrypted = malloc(agent_size);
+    if (!encrypted) die("out of memory");
+    for (size_t i = 0; i < agent_size; i++)
+        encrypted[i] = agent_data[i] ^ key[i % KEY_LEN];
+
+    uint8_t frags[4][8];
+    obfuscate_and_fragment(passphrase, frags);
+
+    FILE *out = fopen(out_path, "w");
+    if (!out) die_errno(out_path);
+
+    char tmp2[4096];
+    snprintf(tmp2, sizeof(tmp2), "%s", agent_path);
+    const char *base = basename(tmp2);
+
+    fprintf(out, "/* stub_payload.h — Auto-generated by gen_stub_payload. Do not edit. */\n");
+    fprintf(out, "/* Agent: %s (%zu bytes, encrypted) */\n\n", base, agent_size);
+
+    fprintf(out, "#define STUB_KEY_LEN  %d\n", KEY_LEN);
+    fprintf(out, "#define STUB_SALT_LEN %d\n", SALT_LEN);
+    fprintf(out, "#define STUB_PASS_LEN %d\n\n", PASS_LEN);
+
+    write_byte_array(out, "stub_salt", SALT_LEN, salt);
+
+    for (int i = 0; i < 4; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "stub_pass_frag%d", i);
+        write_byte_array(out, name, 8, frags[i]);
+    }
+
+    write_payload(out, encrypted, agent_size);
+
+    fclose(out);
+    free(encrypted);
+    free(agent_data);
+
+    fprintf(stdout, "[+] %s (%zu bytes, key=%02x%02x%02x%02x%02x%02x%02x%02x...)\n",
+            out_path, agent_size,
+            key[0], key[1], key[2], key[3],
+            key[4], key[5], key[6], key[7]);
+
+    return 0;
+}

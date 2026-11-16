@@ -246,6 +246,27 @@ func ProcessData(agentData adaptix.AgentData, decryptedData []byte) error {
 					}
 					clearText = displayText
 				}
+
+			case CMD_BOF_KILL:
+				if len(data) >= 4 {
+					killedTaskId := int64(binary.LittleEndian.Uint32(data[0:4]))
+					displayText   = string(data[4:])
+					clearText     = displayText
+					if killedTaskId != 0 && Ts != nil {
+						killedTask := adaptix.TaskData{
+							Type:        adaptix.TASK_TYPE_TASK,
+							AgentId:     agentData.Id,
+							TaskId:      killedTaskId,
+							Completed:   true,
+							FinishDate:  time.Now().Unix(),
+							Sync:        true,
+							MessageType: adaptix.MESSAGE_INFO,
+							Message:     "[killed]",
+							ClearText:   "",
+						}
+						Ts.TsTaskUpdate(agentData.Id, killedTask)
+					}
+				}
 			}
 		}
 

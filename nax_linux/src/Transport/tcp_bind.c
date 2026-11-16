@@ -768,7 +768,9 @@ void nax_tcp_bind_main(NaxAgent *a) {
             /* --- block until parent OR any pivot child has data --- */
             /* Count pivot children */
             int has_pending = (a->download_head != NULL);
-            int timeout_ms  = has_pending ? 50 : -1;
+            int has_async   = 0;
+            { char _jbuf[16]; has_async = (nax_async_list(_jbuf, sizeof(_jbuf)) > 0); }
+            int timeout_ms  = (has_pending || has_async) ? 200 : -1;
 
             /* Build pollfd array: slot 0 = parent, slots 1..N = pivot children */
             int n_pivots = 0;
